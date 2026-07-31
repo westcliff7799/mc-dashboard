@@ -12,8 +12,7 @@ import time
 from collections import deque
 from typing import Any
 
-# Console output and command echoes go to admins only; see broadcast().
-ADMIN_ONLY = {"admin"}
+from . import auth, permissions
 
 MAX_LOG_LINES = 800
 REQUEST_TIMEOUT = 30.0
@@ -30,7 +29,7 @@ class AgentHub:
         self.agent_connected_at: float | None = None
         self.state: dict[str, Any] = {}
         self.logs: deque[dict[str, Any]] = deque(maxlen=MAX_LOG_LINES)
-        self.browsers: dict[Any, str] = {}  # websocket -> role
+        self.browsers: dict[Any, tuple[str, str]] = {}  # websocket -> (username, role)
         self._pending: dict[int, asyncio.Future] = {}
         self._next_id = 0
 
@@ -95,7 +94,7 @@ class AgentHub:
                     continue
                 entry = {"ts": message.get("ts") or time.time(), "line": line}
                 self.logs.append(entry)
-                await self.broadcast({"t": "log", **entry}, roles=ADMIN_ONLY)
+                await self.broadcast({"t": "log", **entry}, permission=permissions.CONSOLE_VIEW)
 
         elif kind == "state":
             self.state = message.get("state", {})
@@ -103,25 +102,29 @@ class AgentHub:
 
     # ---------- browser side ----------
 
-    def add_browser(self, websocket: Any, role: str) -> None:
-        self.browsers[websocket] = role
+    def add_browser(self, websocket: Any, username: str, role: str) -> None:
+        self.browsers[websocket] = (username, role)
 
     def discard_browser(self, websocket: Any) -> None:
         self.browsers.pop(websocket, None)
 
-    async def broadcast(self, payload: dict[str, Any], roles: set[str] | None = None) -> None:
-        """Send to every browser, or only those holding one of `roles`.
+    async def broadcast(self, payload: dict[str, Any], permission: str | None = None) -> None:
+        """Send to every browser, or only those holding `permission`.
 
-        Console lines and command echoes are admin-only. Blocking the REST
-        endpoints is not enough on its own — without this filter a read-only
-        guest would still watch the server console, and every command an admin
-        ran, stream past on their socket.
+        Console lines and command echoes are restricted. Blocking the REST
+        endpoints is not enough on its own — without this filter an account
+        without console access would still watch the server console, and every
+        command anyone ran, stream past on their socket.
+
+        The grant is resolved per send rather than cached on the socket, so
+        revoking console access takes hold on the next line rather than
+        whenever that browser happens to reconnect.
         """
         if not self.browsers:
             return
         dead = []
-        for websocket, role in list(self.browsers.items()):
-            if roles is not None and role not in roles:
+        for websocket, (username, role) in list(self.browsers.items()):
+            if permission is not None and permission not in auth.permissions_for(username, role):
                 continue
             try:
                 await websocket.send_json(payload)

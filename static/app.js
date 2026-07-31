@@ -54,8 +54,10 @@ document.querySelectorAll('.tabs button').forEach((button) => {
       loadBackups();
     }
     if (button.dataset.tab === 'debug') {
-      loadPm2();
-      loadUsers();
+      if (can('debug.pm2')) loadPm2();
+      // Account management is owner-only; asking as anyone else just earns a
+      // 403 and an error toast on every visit to the tab.
+      if (capabilities.role === 'admin') loadUsers();
     }
   });
 });
@@ -114,22 +116,48 @@ function renderAgentState(state) {
   $('t-process-sub').textContent = bits.join(' · ');
 }
 
+function can(permission) {
+  return (capabilities.permissions || []).includes(permission);
+}
+
+function setTabVisible(name, visible) {
+  document.querySelectorAll(`.tabs [data-tab="${name}"]`).forEach((tab) => { tab.hidden = !visible; });
+  const panel = $(`tab-${name}`);
+  if (panel && !visible) { panel.hidden = true; panel.classList.remove('active'); }
+  else if (panel) { panel.hidden = false; }
+}
+
 function applyCapabilities() {
   const agent = capabilities.agent;
 
-  if (capabilities.role === 'guest') {
-    document.querySelectorAll('.tabs [data-tab="console"], .tabs [data-tab="files"], .tabs [data-tab="debug"]')
-      .forEach((tab) => { tab.hidden = true; });
-    ['tab-console', 'tab-files', 'tab-debug'].forEach((id) => {
-      const panel = $(id);
-      if (panel) { panel.hidden = true; panel.classList.remove('active'); }
-    });
-    const power = $('power-card') || $('btn-start').closest('.card');
-    if (power) power.hidden = true;
-    return;
+  const seesConsole = can('console.view') || can('console.command');
+  const seesFiles = can('files.browse') || can('files.read') || can('backup.list') || can('backup.create');
+  const seesDebug = can('debug.pm2') || capabilities.role === 'admin';
+  setTabVisible('console', seesConsole);
+  setTabVisible('files', seesFiles);
+  setTabVisible('debug', seesDebug);
+
+  // The account-management card is the owner's alone, so it is hidden
+  // independently of the debug tab that a `debug.pm2` grant opens up.
+  const userCard = $('user-list') && $('user-list').closest('.card');
+  if (userCard) userCard.hidden = capabilities.role !== 'admin';
+
+  // If the active tab just got hidden, fall back to the overview rather than
+  // leaving the page showing nothing at all.
+  if (!document.querySelector('.panel.active:not([hidden])')) {
+    document.querySelectorAll('.tabs button').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === 'overview')));
+    const overview = $('tab-overview');
+    if (overview) { overview.hidden = false; overview.classList.add('active'); }
   }
 
-  ['btn-start', 'btn-restart', 'btn-stop', 'btn-backup'].forEach((id) => { $(id).disabled = !agent; });
+  const power = $('power-card') || $('btn-start').closest('.card');
+  const anyPower = can('power.start') || can('power.stop') || can('power.restart');
+  if (power) power.hidden = !anyPower && !can('backup.create');
+
+  $('btn-start').disabled = !agent || !can('power.start');
+  $('btn-stop').disabled = !agent || !can('power.stop');
+  $('btn-restart').disabled = !agent || !can('power.restart');
+  $('btn-backup').disabled = !agent || !can('backup.create');
   $('power-unavailable').hidden = agent;
   $('files-notice').hidden = agent;
 
@@ -150,8 +178,8 @@ function applyCapabilities() {
     notice.hidden = true;
   }
 
-  $('cmd').disabled = !capabilities.rcon;
-  $('cmd-send').disabled = !capabilities.rcon;
+  $('cmd').disabled = !capabilities.rcon || !can('console.command');
+  $('cmd-send').disabled = !capabilities.rcon || !can('console.command');
   if (!agent) renderAgentState(null);
 }
 
@@ -387,17 +415,6 @@ function duration(seconds) {
   return `${Math.floor(seconds / 86400)}d`;
 }
 
-function row(cells) {
-  const tr = document.createElement('tr');
-  cells.forEach(([text, className]) => {
-    const td = document.createElement('td');
-    if (className) td.className = className;
-    td.textContent = text;
-    tr.appendChild(td);
-  });
-  return tr;
-}
-
 const PM2_COLUMNS = [
   ['id', 3, 'right'],
   ['name', 24, 'left'],
@@ -472,40 +489,157 @@ async function loadPm2() {
   out.appendChild(document.createTextNode(pm2Rule('└', '┴', '┘')));
 }
 
-async function loadUsers() {
-  const table = $('user-table');
-  try {
-    const data = await api('/api/admin/users');
-    table.innerHTML = '<tr><th>User</th><th>Access</th><th></th></tr>';
-    table.appendChild(row([[data.admin, 'name'], ['admin — full access', ''], ['', '']]));
+let catalogue = [];
 
-    if (!(data.users || []).length) {
-      const empty = document.createElement('tr');
-      empty.innerHTML = '<td colspan="3" class="empty">No read-only users yet.</td>';
-      table.appendChild(empty);
-      return;
-    }
-    data.users.forEach((user) => {
-      const tr = row([[user.username, 'name'], ['read-only', ''], ['', '']]);
-      const button = document.createElement('button');
-      button.className = 'action danger';
-      button.textContent = 'Remove';
-      button.addEventListener('click', async () => {
-        if (!confirm(`Remove ${user.username}?`)) return;
-        try {
-          await api(`/api/admin/users/${encodeURIComponent(user.username)}`, { method: 'DELETE' });
-          toast(`Removed ${user.username}`);
-          loadUsers();
-        } catch (error) {
-          toast(error.message, true);
-        }
-      });
-      tr.lastChild.appendChild(button);
-      table.appendChild(tr);
+function permGrid(container, held, onChange) {
+  container.textContent = '';
+  catalogue.forEach((group) => {
+    const box = document.createElement('fieldset');
+    box.className = 'perm-group';
+    const legend = document.createElement('legend');
+    legend.textContent = group.title;
+    box.appendChild(legend);
+
+    group.permissions.forEach((permission) => {
+      const label = document.createElement('label');
+      label.className = permission.danger ? 'perm danger' : 'perm';
+
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.value = permission.key;
+      input.checked = held.includes(permission.key);
+      if (onChange) input.addEventListener('change', onChange);
+
+      const text = document.createElement('span');
+      const name = document.createElement('span');
+      name.className = 'perm-label';
+      name.textContent = permission.label;
+      const detail = document.createElement('span');
+      detail.className = 'perm-detail';
+      detail.textContent = permission.detail;
+      text.append(name, detail);
+
+      label.append(input, text);
+      box.appendChild(label);
     });
+    container.appendChild(box);
+  });
+}
+
+function readGrid(container) {
+  return Array.from(container.querySelectorAll('input[type="checkbox"]:checked')).map((i) => i.value);
+}
+
+function userCard(user) {
+  const card = document.createElement('div');
+  card.className = 'user-card';
+
+  const head = document.createElement('div');
+  head.className = 'user-head';
+  const name = document.createElement('span');
+  name.className = 'name';
+  name.textContent = user.username;
+  const count = document.createElement('span');
+  count.className = 'perm-count';
+
+  const save = document.createElement('button');
+  save.className = 'action primary';
+  save.type = 'button';
+  save.textContent = 'Save';
+  save.disabled = true;
+
+  const remove = document.createElement('button');
+  remove.className = 'action danger';
+  remove.type = 'button';
+  remove.textContent = 'Remove';
+
+  const spacer = document.createElement('span');
+  spacer.style.flex = '1';
+  head.append(name, count, spacer, save, remove);
+
+  const grid = document.createElement('div');
+  grid.className = 'perm-grid';
+
+  const refreshCount = () => {
+    const n = readGrid(grid).length;
+    count.textContent = n === 0 ? 'overview only' : `${n} of ${totalPermissions()}`;
+  };
+  const markDirty = () => { save.disabled = false; refreshCount(); };
+
+  permGrid(grid, user.permissions || [], markDirty);
+  refreshCount();
+
+  save.addEventListener('click', async () => {
+    save.disabled = true;
+    try {
+      await api(`/api/admin/users/${encodeURIComponent(user.username)}/permissions`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ permissions: readGrid(grid) }),
+      });
+      toast(`Updated ${user.username}`);
+      loadUsers();
+    } catch (error) {
+      toast(error.message, true);
+      save.disabled = false;
+    }
+  });
+
+  remove.addEventListener('click', async () => {
+    if (!confirm(`Remove ${user.username}?`)) return;
+    try {
+      await api(`/api/admin/users/${encodeURIComponent(user.username)}`, { method: 'DELETE' });
+      toast(`Removed ${user.username}`);
+      loadUsers();
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+
+  card.append(head, grid);
+  return card;
+}
+
+function totalPermissions() {
+  return catalogue.reduce((n, group) => n + group.permissions.length, 0);
+}
+
+async function loadUsers() {
+  const list = $('user-list');
+  let data;
+  try {
+    data = await api('/api/admin/users');
   } catch (error) {
     toast(error.message, true);
+    return;
   }
+
+  catalogue = data.catalogue || [];
+  permGrid($('new-user-perms'), []);
+  list.textContent = '';
+
+  const owner = document.createElement('div');
+  owner.className = 'user-card owner';
+  const ownerHead = document.createElement('div');
+  ownerHead.className = 'user-head';
+  const ownerName = document.createElement('span');
+  ownerName.className = 'name';
+  ownerName.textContent = data.admin;
+  const ownerNote = document.createElement('span');
+  ownerNote.className = 'perm-count';
+  ownerNote.textContent = 'owner — everything, set in .env';
+  ownerHead.append(ownerName, ownerNote);
+  owner.appendChild(ownerHead);
+  list.appendChild(owner);
+
+  if (!(data.users || []).length) {
+    const empty = document.createElement('p');
+    empty.className = 'empty';
+    empty.textContent = 'No other accounts yet.';
+    list.appendChild(empty);
+    return;
+  }
+  data.users.forEach((user) => list.appendChild(userCard(user)));
 }
 
 $('btn-pm2-refresh').addEventListener('click', loadPm2);
@@ -518,7 +652,7 @@ $('userform').addEventListener('submit', async (event) => {
     await api('/api/admin/users', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ username, password, permissions: readGrid($('new-user-perms')) }),
     });
     $('new-username').value = '';
     $('new-password').value = '';

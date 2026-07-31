@@ -125,18 +125,28 @@
       </div>
 
       <div class="card">
-        <h2>Read-only users</h2>
-        <p class="sub">These accounts see the overview only — no console, no
-          commands, no files. Your admin account lives in <code>.env</code> and
-          can't be changed from here.</p>
-        <table class="files" id="user-table"></table>
-        <form class="cmdbar" id="userform" style="margin-top:12px">
-          <input id="new-username" placeholder="username" autocomplete="off"
-                 spellcheck="false" aria-label="New username">
-          <input id="new-password" type="password" placeholder="password (12+ characters)"
-                 autocomplete="new-password" aria-label="New password">
-          <button class="action primary" type="submit" id="btn-add-user">Add user</button>
-        </form>
+        <h2>Users &amp; permissions</h2>
+        <p class="sub">Every account starts with the overview and nothing else.
+          Tick what each one may do — changes take effect on their next request,
+          no re-login needed. Your owner account lives in <code>.env</code>,
+          always holds everything, and can't be changed from here.</p>
+        <div id="user-list"></div>
+
+        <details class="new-user">
+          <summary>Add an account</summary>
+          <form id="userform">
+            <div class="cmdbar">
+              <input id="new-username" placeholder="username" autocomplete="off"
+                     spellcheck="false" aria-label="New username">
+              <input id="new-password" type="password" placeholder="password (12+ characters)"
+                     autocomplete="new-password" aria-label="New password">
+              <button class="action primary" type="submit" id="btn-add-user">Create</button>
+            </div>
+            <p class="sub" style="margin:10px 0 0">Starting permissions — all optional,
+              and editable afterwards.</p>
+            <div class="perm-grid" id="new-user-perms"></div>
+          </form>
+        </details>
       </div>
     </section>
   </main>

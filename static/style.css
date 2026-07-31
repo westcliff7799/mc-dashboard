@@ -359,3 +359,77 @@ table.files .name { font-family: var(--mono); }
 }
 .toast.show { opacity: 1; }
 .toast.bad { border-left-color: var(--critical); }
+
+/* ---------------------------------------------------------------- permissions */
+
+.user-card {
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  background: var(--page);
+}
+.user-card.owner { opacity: 0.85; }
+
+.user-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.user-head .name { font-family: var(--mono); font-weight: 600; }
+.user-head .perm-count { font-size: 12px; color: var(--text-secondary); }
+.user-head button { margin-left: 4px; }
+
+.perm-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+.user-card .perm-grid { border-top: 1px solid var(--hairline); padding-top: 12px; }
+
+fieldset.perm-group {
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  padding: 8px 10px 10px;
+  margin: 0;
+  min-width: 0;
+}
+fieldset.perm-group legend {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  padding: 0 4px;
+}
+
+label.perm {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 5px 2px;
+  cursor: pointer;
+  font-size: 13px;
+}
+label.perm input { margin-top: 2px; flex-shrink: 0; }
+label.perm .perm-label { display: block; font-weight: 550; }
+/* The tint is a second cue only; the label already names what it does. */
+label.perm.danger .perm-label { color: var(--serious); }
+label.perm .perm-detail {
+  display: block;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  line-height: 1.35;
+  margin-top: 1px;
+}
+
+details.new-user { margin-top: 14px; border-top: 1px solid var(--hairline); padding-top: 12px; }
+details.new-user summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 550;
+  color: var(--text-secondary);
+}
+details.new-user summary:hover { color: var(--text-primary); }
+details.new-user form { margin-top: 12px; }

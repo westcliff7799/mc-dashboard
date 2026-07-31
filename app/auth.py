@@ -14,18 +14,22 @@ import os
 import re
 import secrets
 import time
+from typing import Any
 
+from . import permissions
 from .config import ROOT, settings
 
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**14, 8, 1
 COOKIE_NAME = "mcdash_session"
 
+# Two roles still, but they now mean "who you are", not "what you may do".
+# ROLE_ADMIN is the .env owner and always holds every permission; every account
+# in users.json is ROLE_GUEST and holds exactly what it has been granted.
 ROLE_ADMIN = "admin"
 ROLE_GUEST = "guest"
 
-# Extra accounts added from the debug panel. The owner's account stays in .env
-# and is the only admin — everything in this file is read-only, so a mistake in
-# the panel can't produce someone who can stop the server.
+# Extra accounts added from the debug panel. The owner's account stays in .env,
+# so no combination of grants made here can produce a second owner.
 USERS_FILE = ROOT / "users.json"
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{2,32}$")
 MIN_PASSWORD_LENGTH = 12
@@ -130,22 +134,73 @@ def clear_failures(client_ip: str) -> None:
     _attempts.pop(client_ip, None)
 
 
-def load_users() -> list[dict[str, str]]:
+_cache_stamp: tuple[int, int] | None = None
+_cache_users: list[dict[str, Any]] = []
+
+
+def _stamp() -> tuple[int, int] | None:
+    """Cheap identity for the current file contents, or None if unreadable."""
+    try:
+        stat = USERS_FILE.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def load_users() -> list[dict[str, Any]]:
     """Read the added-user store. Never raises — a corrupt or missing file
-    must not lock the owner out of their own dashboard."""
+    must not lock the owner out of their own dashboard.
+
+    Cached against the file's mtime and size, because authorization now reads
+    this on every request and on every console line broadcast. save_users()
+    replaces the file, which moves the stamp, so a write invalidates the cache
+    without needing to remember to clear it.
+    """
+    global _cache_stamp, _cache_users
+
+    stamp = _stamp()
+    if stamp is not None and stamp == _cache_stamp:
+        return [dict(entry) for entry in _cache_users]
+
     try:
         data = json.loads(USERS_FILE.read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError):
+        _cache_stamp, _cache_users = stamp, []
         return []
+
     entries = data.get("users") if isinstance(data, dict) else None
-    return [
-        entry
-        for entry in (entries or [])
-        if isinstance(entry, dict) and entry.get("username") and entry.get("password_hash")
-    ]
+    parsed: list[dict[str, Any]] = []
+    for entry in entries or []:
+        if not (isinstance(entry, dict) and entry.get("username") and entry.get("password_hash")):
+            continue
+        normalized = dict(entry)
+        # Accounts written before permissions existed carry `role: guest` and
+        # nothing else; they come back with an empty grant, which is exactly
+        # what "read-only guest" already meant.
+        normalized["permissions"] = permissions.sanitize(entry.get("permissions"))
+        parsed.append(normalized)
+
+    _cache_stamp, _cache_users = stamp, parsed
+    return [dict(entry) for entry in parsed]
 
 
-def save_users(users: list[dict[str, str]]) -> None:
+def permissions_for(username: str, role: str) -> frozenset[str]:
+    """What this account may actually do, right now.
+
+    Deliberately read from storage rather than from the session token. Tokens
+    live for SESSION_HOURS (a week by default), so a token-embedded grant would
+    make revocation take up to that long to bite. Looking it up per request
+    means un-ticking a box logs the change in immediately.
+    """
+    if role == ROLE_ADMIN:
+        return permissions.ALL
+    for entry in load_users():
+        if entry["username"] == username:
+            return frozenset(entry["permissions"])
+    return frozenset()
+
+
+def save_users(users: list[dict[str, Any]]) -> None:
     """Write via a temp file and rename, so a crash mid-write can't leave a
     truncated store that would lock every added user out."""
     temporary = USERS_FILE.with_name(USERS_FILE.name + ".tmp")
@@ -154,8 +209,12 @@ def save_users(users: list[dict[str, str]]) -> None:
     os.replace(temporary, USERS_FILE)
 
 
-def add_user(username: str, password: str) -> None:
-    """Add a read-only account. Raises ValueError with a message fit to show."""
+def add_user(username: str, password: str, granted: Any = None) -> None:
+    """Add an account. Raises ValueError with a message fit to show.
+
+    `granted` is passed through sanitize(), so an unknown permission string is
+    dropped rather than stored.
+    """
     username = username.strip()
     if not USERNAME_PATTERN.match(username):
         raise ValueError("Username must be 2-32 characters: letters, digits, dot, dash, underscore.")
@@ -168,9 +227,30 @@ def add_user(username: str, password: str) -> None:
     if any(existing["username"].lower() == username.lower() for existing in users):
         raise ValueError("That user already exists.")
     users.append(
-        {"username": username, "role": ROLE_GUEST, "password_hash": hash_password(password)}
+        {
+            "username": username,
+            "role": ROLE_GUEST,
+            "permissions": permissions.sanitize(granted),
+            "password_hash": hash_password(password),
+        }
     )
     save_users(users)
+
+
+def set_user_permissions(username: str, granted: Any) -> bool:
+    """Replace one account's grant. False if there is no such account.
+
+    Matching is exact, unlike the duplicate check in add_user() — the name
+    comes from a panel that was populated by load_users(), so it is already in
+    the stored casing.
+    """
+    users = load_users()
+    for entry in users:
+        if entry["username"] == username:
+            entry["permissions"] = permissions.sanitize(granted)
+            save_users(users)
+            return True
+    return False
 
 
 def delete_user(username: str) -> bool:

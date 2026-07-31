@@ -11,7 +11,7 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request, WebSocket, W
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import agenthub, auth, ping, rcon
+from . import agenthub, auth, permissions, ping, rcon
 from .agenthub import hub
 from .config import ROOT, settings
 
@@ -100,15 +100,35 @@ def current_user(request: Request) -> str:
 
 
 def require_admin(request: Request) -> str:
-    """Anything that can change the server, read its files, or see its console.
+    """The .env owner only. Guards account management itself.
 
-    The role comes out of the signed session token, so this cannot be talked
-    into passing by editing a cookie.
+    Deliberately not expressed as a grantable permission: anyone who can edit
+    grants can grant themselves everything, so "may manage users" and "is the
+    owner" are the same authority. Keeping it tied to the signed role means no
+    combination of checkboxes in the panel can mint a second owner.
     """
     user, role = current_session(request)
     if role != auth.ROLE_ADMIN:
-        raise HTTPException(status_code=403, detail="this account is read-only")
+        raise HTTPException(status_code=403, detail="owner only")
     return user
+
+
+def require(*needed: str):
+    """Build a dependency that passes only if the caller holds every `needed`.
+
+    Authorization is resolved from storage per request rather than from the
+    session token, so a revoked permission takes effect on the caller's very
+    next request instead of whenever their week-long session happens to expire.
+    """
+
+    def dependency(request: Request) -> str:
+        user, role = current_session(request)
+        held = auth.permissions_for(user, role)
+        if missing := [name for name in needed if name not in held]:
+            raise HTTPException(status_code=403, detail=f"missing permission: {', '.join(missing)}")
+        return user
+
+    return dependency
 
 
 TRUSTED_PROXIES = {"127.0.0.1", "::1"}
@@ -262,7 +282,7 @@ async def api_status(_: str = Depends(current_user)):
 
 @app.get("/api/capabilities")
 async def api_capabilities(request: Request):
-    _, role = current_session(request)
+    user, role = current_session(request)
     return {
         "rcon": settings.rcon_enabled,
         "agent": hub.connected,
@@ -271,11 +291,12 @@ async def api_capabilities(request: Request):
         # The UI hides what this account can't use. The server enforces it
         # regardless — this is a courtesy, not the boundary.
         "role": role,
+        "permissions": sorted(auth.permissions_for(user, role)),
     }
 
 
 @app.post("/api/command")
-async def api_command(payload: dict, user: str = Depends(require_admin)):
+async def api_command(payload: dict, user: str = Depends(require(permissions.CONSOLE_COMMAND))):
     command = (payload.get("command") or "").strip().lstrip("/")
     if not command:
         raise HTTPException(400, "empty command")
@@ -290,21 +311,29 @@ async def api_command(payload: dict, user: str = Depends(require_admin)):
 
     await hub.broadcast(
         {"t": "log", "ts": time.time(), "line": f"[{user}] > /{command}", "kind": "echo"},
-        roles=agenthub.ADMIN_ONLY,
+        permission=permissions.CONSOLE_VIEW,
     )
     if output:
         await hub.broadcast(
             {"t": "log", "ts": time.time(), "line": output, "kind": "reply"},
-            roles=agenthub.ADMIN_ONLY,
+            permission=permissions.CONSOLE_VIEW,
         )
     return {"ok": True, "output": output}
 
 
 @app.post("/api/power")
-async def api_power(payload: dict, user: str = Depends(require_admin)):
+async def api_power(payload: dict, request: Request):
     action = payload.get("action")
     if action not in {"start", "stop", "restart"}:
         raise HTTPException(400, "action must be start, stop or restart")
+
+    # Checked per action rather than as one lump: starting a stopped server is
+    # not the same favour as disconnecting everyone on a running one.
+    user, role = current_session(request)
+    needed = f"power.{action}"
+    if needed not in auth.permissions_for(user, role):
+        raise HTTPException(403, f"missing permission: {needed}")
+
     if not hub.connected:
         raise HTTPException(409, "the agent is not connected — lifecycle control is unavailable")
     try:
@@ -313,18 +342,18 @@ async def api_power(payload: dict, user: str = Depends(require_admin)):
         raise HTTPException(502, str(exc))
     await hub.broadcast(
         {"t": "log", "ts": time.time(), "line": f"[{user}] requested {action}", "kind": "echo"},
-        roles=agenthub.ADMIN_ONLY,
+        permission=permissions.CONSOLE_VIEW,
     )
     return result
 
 
 @app.get("/api/logs")
-async def api_logs(_: str = Depends(require_admin)):
+async def api_logs(_: str = Depends(require(permissions.CONSOLE_VIEW))):
     return {"lines": hub.recent_logs()}
 
 
 @app.get("/api/files")
-async def api_files(path: str = "", _: str = Depends(require_admin)):
+async def api_files(path: str = "", _: str = Depends(require(permissions.FILES_BROWSE))):
     if not hub.connected:
         raise HTTPException(409, "the agent is not connected — file access is unavailable")
     try:
@@ -334,7 +363,7 @@ async def api_files(path: str = "", _: str = Depends(require_admin)):
 
 
 @app.get("/api/files/read")
-async def api_file_read(path: str, _: str = Depends(require_admin)):
+async def api_file_read(path: str, _: str = Depends(require(permissions.FILES_READ))):
     if not hub.connected:
         raise HTTPException(409, "the agent is not connected — file access is unavailable")
     try:
@@ -344,7 +373,7 @@ async def api_file_read(path: str, _: str = Depends(require_admin)):
 
 
 @app.post("/api/backup")
-async def api_backup(user: str = Depends(require_admin)):
+async def api_backup(user: str = Depends(require(permissions.BACKUP_CREATE))):
     if not hub.connected:
         raise HTTPException(409, "the agent is not connected — backups are unavailable")
     try:
@@ -353,13 +382,13 @@ async def api_backup(user: str = Depends(require_admin)):
         raise HTTPException(502, str(exc))
     await hub.broadcast(
         {"t": "log", "ts": time.time(), "line": f"[{user}] triggered a backup", "kind": "echo"},
-        roles=agenthub.ADMIN_ONLY,
+        permission=permissions.CONSOLE_VIEW,
     )
     return result
 
 
 @app.get("/api/backups")
-async def api_backups(_: str = Depends(require_admin)):
+async def api_backups(_: str = Depends(require(permissions.BACKUP_LIST))):
     if not hub.connected:
         raise HTTPException(409, "the agent is not connected")
     try:
@@ -376,7 +405,7 @@ PM2_BIN = shutil.which("pm2") or "/usr/bin/pm2"
 
 
 @app.get("/api/admin/pm2")
-async def api_pm2(_: str = Depends(require_admin)):
+async def api_pm2(_: str = Depends(require(permissions.DEBUG_PM2))):
     """PM2 process table.
 
     Only the handful of fields below are passed through. `pm2 jlist` embeds
@@ -431,9 +460,12 @@ async def api_pm2(_: str = Depends(require_admin)):
 async def api_list_users(_: str = Depends(require_admin)):
     return {
         "admin": settings.admin_user,
-        # Hashes stay server-side; the panel only ever needs the names.
+        # The panel renders its checkboxes from this rather than from a copy
+        # hardcoded in the JS, so the two cannot drift apart.
+        "catalogue": permissions.GROUPS,
+        # Hashes stay server-side; the panel only ever needs names and grants.
         "users": [
-            {"username": entry["username"], "role": entry.get("role", auth.ROLE_GUEST)}
+            {"username": entry["username"], "permissions": entry["permissions"]}
             for entry in auth.load_users()
         ],
     }
@@ -442,10 +474,30 @@ async def api_list_users(_: str = Depends(require_admin)):
 @app.post("/api/admin/users")
 async def api_add_user(payload: dict, _: str = Depends(require_admin)):
     try:
-        auth.add_user(str(payload.get("username", "")), str(payload.get("password", "")))
+        auth.add_user(
+            str(payload.get("username", "")),
+            str(payload.get("password", "")),
+            payload.get("permissions"),
+        )
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"ok": True}
+
+
+@app.put("/api/admin/users/{username}/permissions")
+async def api_set_permissions(username: str, payload: dict, _: str = Depends(require_admin)):
+    """Replace one account's grant outright.
+
+    The whole set is sent rather than a delta, so two panels open at once can't
+    interleave into a grant neither operator chose — the last save wins as a
+    unit and the panel reloads to show it.
+    """
+    granted = payload.get("permissions")
+    if not isinstance(granted, list):
+        raise HTTPException(400, "permissions must be a list")
+    if not auth.set_user_permissions(username, granted):
+        raise HTTPException(404, "no such user")
+    return {"ok": True, "permissions": permissions.sanitize(granted)}
 
 
 @app.delete("/api/admin/users/{username}")
@@ -466,15 +518,15 @@ async def browser_socket(websocket: WebSocket):
     if not session:
         await websocket.close(code=4401, reason="not authenticated")
         return
-    _, role = session
+    username, role = session
     await websocket.accept()
-    hub.add_browser(websocket, role)
+    hub.add_browser(websocket, username, role)
     try:
         await websocket.send_json({"t": "status", "status": status_cache})
         await websocket.send_json({"t": "agent", "connected": hub.connected})
-        # The console backlog is the same admin-only data as the live feed —
-        # handing it over at connect time would undo the broadcast filter.
-        if role == auth.ROLE_ADMIN:
+        # The console backlog is the same data as the live feed — handing it
+        # over at connect time would undo the broadcast filter.
+        if permissions.CONSOLE_VIEW in auth.permissions_for(username, role):
             await websocket.send_json({"t": "backlog", "lines": hub.recent_logs()})
         if hub.state:
             await websocket.send_json({"t": "state", "state": hub.state})
