@@ -65,6 +65,12 @@ async def _execute_locked(host: str, port: int, password: str, command: str) -> 
         # marker. Trailing an empty command lets us detect the true end: the
         # sentinel's reply cannot arrive before the real command's last packet.
         writer.write(_encode(2, EXEC, command))
+        await writer.drain()
+        # Vanilla's RCON listener reads exactly one packet per connection and
+        # drops the socket if a second packet arrives in the same TCP segment
+        # (the two small writes above otherwise get coalesced by Nagle). Let
+        # the first segment go out on its own before sending the sentinel.
+        await asyncio.sleep(0.05)
         writer.write(_encode(3, EXEC, ""))
         await writer.drain()
 
