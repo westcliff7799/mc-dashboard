@@ -2,22 +2,34 @@
 Description=Minecraft Dashboard
 After=network-online.target
 Wants=network-online.target
+# Never stop trying. The default is to give up after 5 restarts in 10s and
+# leave the unit dead — which turns a transient fault at 3am (a wifi drop
+# during startup, a port still in TIME_WAIT) into permanent downtime that
+# nothing recovers from until someone notices and logs in.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=westcliff7799
-WorkingDirectory=/home/westcliff7799/mc-dashboard
-ExecStart=/home/westcliff7799/mc-dashboard/.venv/bin/uvicorn app.main:app \
-    --host 127.0.0.1 --port 8080 --proxy-headers --forwarded-allow-ips='127.0.0.1'
+WorkingDirectory=/home/westcliff7799/mc-dashboard-1
+# --no-proxy-headers is deliberate. Uvicorn's own handling overwrites
+# request.client with the LEFTMOST X-Forwarded-For entry, which is the part the
+# client sends — and since the tunnel makes every peer 127.0.0.1, it would
+# always trust it. The login lockout keys on that address, so app/main.py does
+# the parsing instead (rightmost hop, gated on TRUST_PROXY_HEADERS).
+ExecStart=/home/westcliff7799/mc-dashboard-1/.venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 --port 8080 --no-proxy-headers
 Restart=always
 RestartSec=5
+# Don't let a socket that won't drain hold the restart open indefinitely.
+TimeoutStopSec=20
 
 # Binding to localhost only: the tunnel is the sole way in.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/westcliff7799/mc-dashboard
+ReadWritePaths=/home/westcliff7799/mc-dashboard-1
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true

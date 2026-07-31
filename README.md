@@ -48,22 +48,69 @@ cp .env.example .env
 nano .env                               # paste it in, set MC_HOST, SECRET_KEY
 chmod 600 .env
 
-.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080
+.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080 --no-proxy-headers
 ```
 
 Open `http://<pi-ip>:8080`. For this first LAN test set `SECURE_COOKIE=false`,
 since the session cookie is marked `Secure` and a browser won't store it over
 plain HTTP.
 
-Then install the service:
+`--no-proxy-headers` is not optional. Uvicorn otherwise rewrites the client
+address from the *leftmost* `X-Forwarded-For` entry — the part the client
+supplies — and the login lockout keys on that address, so a caller who sends a
+different value each time gets unlimited password attempts. The app parses the
+headers itself instead: only from a loopback peer, preferring Cloudflare's
+`CF-Connecting-IP`, and taking the rightmost hop. That parsing stays off until
+you set `TRUST_PROXY_HEADERS=true`, which you should do only once the tunnel
+below is actually in front.
+
+Then install the service and the supervision around it:
 
 ```bash
-sudo cp deploy/mc-dashboard.service /etc/systemd/system/
-sudo systemctl enable --now mc-dashboard
+sudo deploy/install-supervision.sh
 journalctl -u mc-dashboard -f
 ```
 
 Note it binds to `127.0.0.1` — the tunnel below is the only way in.
+
+## Staying up
+
+Four layers, each catching what the one below it can't:
+
+| Failure | What catches it |
+| --- | --- |
+| Process exits or crashes | `Restart=always`, with `StartLimitIntervalSec=0` so systemd never gives up |
+| Process alive but wedged | `/healthz` + the supervisor timer — 3 bad probes in a row triggers a restart |
+| You edited the code | Same timer notices the change and restarts, *after* checking it imports |
+| Kernel hang, OOM freeze, panic | BCM2835 hardware watchdog + `kernel.panic=10` |
+
+The one that isn't obvious is the second. `Restart=always` only fires when the
+process *exits* — an event loop that has wedged keeps the process alive and the
+unit `active` while it serves nothing at all, and systemd is perfectly happy.
+So `/healthz` reports whether the poll loop is still turning, and the supervisor
+restarts on that rather than on liveness of the process.
+
+Two deliberate refusals in `deploy/supervise.sh`:
+
+- **It won't restart into code that doesn't import.** A half-finished save would
+  otherwise take the dashboard down and leave systemd restart-looping on it. The
+  running version stays up until the code is valid again.
+- **It won't restart a unit you stopped by hand.** `systemctl stop` means you
+  wanted it stopped; only the `failed` state gets recovered.
+
+The watchdog needs a reboot to arm. Confirm it afterwards:
+
+```bash
+journalctl -b | grep -i watchdog        # "Watchdog running with a timeout of 14s"
+systemctl list-timers mc-dashboard-supervise.timer
+```
+
+To stop auto-restarting on edits but keep everything else, set
+`Environment=WATCH_CODE=0` in `mc-dashboard-supervise.service`.
+
+**Once you add the tunnel, it becomes the single point of failure** — the
+dashboard can be perfectly healthy and still unreachable if `cloudflared` dies.
+Give its unit the same `Restart=always` and `StartLimitIntervalSec=0`.
 
 ## Exposing it publicly
 

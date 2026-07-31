@@ -92,12 +92,35 @@ def current_user(request: Request) -> str:
     return user
 
 
+TRUSTED_PROXIES = {"127.0.0.1", "::1"}
+
+
 def client_ip(request: Request) -> str:
-    # Cloudflare Tunnel / nginx put the real client here; fall back to the peer.
-    forwarded = request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """The address the login lockout is keyed on.
+
+    This value decides whether an attacker gets 8 password guesses or an
+    unlimited number, so it is only ever read from a source the client cannot
+    choose:
+
+    * the headers are ignored entirely unless TRUST_PROXY_HEADERS is on *and*
+      the immediate peer is loopback (the tunnel is the sole way in);
+    * CF-Connecting-IP is preferred — Cloudflare overwrites it, so the client
+      cannot forge it;
+    * X-Forwarded-For is read right-to-left. A proxy *appends* the peer it saw,
+      so the rightmost entry is the one our own trusted hop wrote. The leftmost
+      is whatever the client sent, and keying on it lets one attacker mint a
+      fresh identity per request and never trip the lockout.
+    """
+    peer = request.client.host if request.client else "unknown"
+    if not (settings.trust_proxy_headers and peer in TRUSTED_PROXIES):
+        return peer
+
+    if cf := request.headers.get("cf-connecting-ip"):
+        return cf.strip()
+    if forwarded := request.headers.get("x-forwarded-for"):
+        if hops := [hop.strip() for hop in forwarded.split(",") if hop.strip()]:
+            return hops[-1]
+    return peer
 
 
 @app.middleware("http")
@@ -107,10 +130,41 @@ async def security_headers(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Content-Security-Policy"] = (
+        # 'self' covers the ws:/wss: upgrade to this same origin; naming the bare
+        # schemes would also permit a socket to any host on the internet.
         "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
-        "connect-src 'self' ws: wss:; base-uri 'none'; form-action 'self'"
+        "connect-src 'self'; base-uri 'none'; form-action 'self'"
     )
     return response
+
+
+# --------------------------------------------------------------------------
+# liveness
+# --------------------------------------------------------------------------
+
+
+@app.get("/healthz")
+async def healthz():
+    """Whether our own poll loop is still turning.
+
+    Unauthenticated, because the supervisor has to reach it before anyone logs
+    in — and therefore deliberately mute: no hostname, no player list, no error
+    text, nothing an unauthenticated caller could learn from.
+
+    The distinction that matters is "this process is wedged", not "the Minecraft
+    server is down". The loop re-polls every poll_seconds and swallows its own
+    errors, stamping checked_at either way, so a stale timestamp means the task
+    itself died or the event loop stopped turning — the two failures that leave
+    systemd looking at a perfectly healthy "active" process serving nothing.
+    """
+    checked_at = status_cache.get("checked_at")
+    age = None if checked_at is None else time.time() - checked_at
+    deadline = max(30.0, settings.poll_seconds * 3 + 10)
+    alive = age is not None and age <= deadline
+    return JSONResponse(
+        {"ok": alive, "poll_age_seconds": None if age is None else round(age, 1)},
+        status_code=200 if alive else 503,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -159,7 +213,14 @@ async def do_login(request: Request, username: str = Form(...), password: str = 
 @app.post("/api/logout")
 async def do_logout():
     response = JSONResponse({"ok": True})
-    response.delete_cookie(auth.COOKIE_NAME)
+    # The attributes have to mirror the ones used at set_cookie time or the
+    # browser keeps the original cookie alongside the expired one.
+    response.delete_cookie(
+        auth.COOKIE_NAME,
+        httponly=True,
+        samesite="lax",
+        secure=settings.secure_cookie,
+    )
     return response
 
 
@@ -306,13 +367,11 @@ async def agent_socket(websocket: WebSocket):
         await websocket.close(code=4403, reason="agent support is disabled")
         return
 
-    import hmac
-
     token = websocket.query_params.get("token") or ""
     header = websocket.headers.get("authorization", "")
     if header.lower().startswith("bearer "):
         token = header[7:]
-    if not hmac.compare_digest(token, settings.agent_token):
+    if not auth.constant_time_equal(token, settings.agent_token):
         await websocket.close(code=4401, reason="bad agent token")
         return
 

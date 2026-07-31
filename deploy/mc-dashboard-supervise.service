@@ -1,0 +1,19 @@
+[Unit]
+Description=Minecraft Dashboard supervisor (liveness probe + code reload)
+After=mc-dashboard.service
+# Not Requires=: if the dashboard is stopped we still want to tick, because
+# noticing the failed state is half of what this thing is for.
+
+[Service]
+Type=oneshot
+# Runs as root so it can restart the dashboard unit — which is exactly why it
+# executes the root-owned copy under /usr/local/sbin rather than the one in the
+# repo. Anything root runs must not sit in a directory the app account can
+# write to. The installer puts it there; re-run it after editing supervise.sh.
+ExecStart=/usr/local/sbin/mc-dashboard-supervise
+TimeoutStartSec=90
+
+# Set WATCH_CODE=0 to keep the liveness probe but stop restarting on edits.
+Environment=WATCH_CODE=1
+Environment=APP_USER=westcliff7799
+Environment=APP_DIR=/home/westcliff7799/mc-dashboard-1

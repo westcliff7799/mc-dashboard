@@ -55,6 +55,13 @@ class Settings:
         default_factory=lambda: os.environ.get("SECURE_COOKIE", "true").lower() == "true"
     )
 
+    # Only turn this off-by-default flag on when something in front of the app
+    # actually rewrites the forwarded headers, or the login lockout can be
+    # sidestepped by anyone who can set them himself.
+    trust_proxy_headers: bool = field(
+        default_factory=lambda: os.environ.get("TRUST_PROXY_HEADERS", "false").lower() == "true"
+    )
+
     poll_seconds: int = field(default_factory=lambda: _int("POLL_SECONDS", 10))
 
     @property

@@ -48,6 +48,20 @@ def verify_password(password: str, stored: str) -> bool:
         return False
 
 
+def constant_time_equal(left: str, right: str) -> bool:
+    """Compare two attacker-supplied strings without leaking timing.
+
+    `hmac.compare_digest` raises TypeError on str with non-ASCII characters, and
+    every caller here feeds it something off the wire — a cookie, a form field, a
+    query param. Comparing the encoded bytes keeps a stray "é" from turning into
+    an unhandled 500.
+    """
+    try:
+        return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+    except UnicodeEncodeError:
+        return False  # unencodable input cannot equal a value we produced
+
+
 def _sign(message: str) -> str:
     signature = hmac.new(settings.secret_key.encode(), message.encode(), hashlib.sha256).digest()
     return base64.urlsafe_b64encode(signature).decode().rstrip("=")
@@ -67,7 +81,7 @@ def validate_session(token: str | None) -> str | None:
         username, expires_raw, signature = token.rsplit(":", 2)
     except ValueError:
         return None
-    if not hmac.compare_digest(signature, _sign(f"{username}:{expires_raw}")):
+    if not constant_time_equal(signature, _sign(f"{username}:{expires_raw}")):
         return None
     try:
         if int(expires_raw) < time.time():
@@ -100,6 +114,6 @@ def check_credentials(username: str, password: str) -> bool:
         return False
     # Compare both fields even when the username is wrong, so response timing
     # doesn't reveal whether the username exists.
-    user_ok = hmac.compare_digest(username, settings.admin_user)
+    user_ok = constant_time_equal(username, settings.admin_user)
     pass_ok = verify_password(password, settings.admin_password_hash)
     return user_ok and pass_ok

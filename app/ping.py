@@ -15,6 +15,10 @@ from typing import Any
 # recent protocol number works. 767 == 1.21.
 PROTOCOL_VERSION = 767
 
+# A status response is a few KB; the favicon is the only large field. The cap
+# stops a hostile host from getting us to allocate on a made-up length prefix.
+MAX_STATUS_BYTES = 512 * 1024
+
 
 def _write_varint(value: int) -> bytes:
     out = bytearray()
@@ -81,26 +85,31 @@ async def ping(host: str, port: int, timeout: float = 5.0) -> dict[str, Any]:
     started = time.perf_counter()
     writer = None
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=timeout
-        )
+        # One deadline over the whole exchange. Timing each read separately
+        # leaves a host that accepts the connection and then dribbles bytes
+        # (tarpits, misconfigured firewalls) able to stall the poll loop forever.
+        async with asyncio.timeout(timeout):
+            reader, writer = await asyncio.open_connection(host, port)
 
-        handshake = (
-            _write_varint(PROTOCOL_VERSION)
-            + _write_string(host)
-            + struct.pack(">H", port)
-            + _write_varint(1)  # next state: status
-        )
-        writer.write(_packet(0x00, handshake))
-        writer.write(_packet(0x00, b""))  # status request
-        await writer.drain()
+            handshake = (
+                _write_varint(PROTOCOL_VERSION)
+                + _write_string(host)
+                + struct.pack(">H", port)
+                + _write_varint(1)  # next state: status
+            )
+            writer.write(_packet(0x00, handshake))
+            writer.write(_packet(0x00, b""))  # status request
+            await writer.drain()
 
-        await asyncio.wait_for(_read_varint(reader), timeout=timeout)  # frame length
-        packet_id = await _read_varint(reader)
-        if packet_id != 0x00:
-            raise ValueError(f"unexpected packet id {packet_id}")
-        length = await _read_varint(reader)
-        raw = await asyncio.wait_for(reader.readexactly(length), timeout=timeout)
+            await _read_varint(reader)  # frame length
+            packet_id = await _read_varint(reader)
+            if packet_id != 0x00:
+                raise ValueError(f"unexpected packet id {packet_id}")
+            length = await _read_varint(reader)
+            if not 0 < length <= MAX_STATUS_BYTES:
+                raise ValueError(f"implausible status length {length}")
+            raw = await reader.readexactly(length)
+
         latency_ms = round((time.perf_counter() - started) * 1000, 1)
 
         data = json.loads(raw.decode("utf-8"))
