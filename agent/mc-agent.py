@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import tarfile
 import time
+from typing import TextIO
 
 try:
     import websockets
@@ -181,6 +182,8 @@ class Controller:
                 self.managed.stdin.flush()
             except Exception:
                 pass
+        if self.managed is None:
+            return False, "no managed process to stop"
         try:
             self.managed.wait(timeout=60)
             return True, "stopped"
@@ -200,8 +203,8 @@ class LogTail:
 
     def __init__(self, server_dir: pathlib.Path) -> None:
         self.path = server_dir / "logs" / "latest.log"
-        self.handle = None
-        self.inode = None
+        self.handle: TextIO | None = None
+        self.inode: int | None = None
 
     def _reopen(self) -> None:
         if self.handle:
@@ -326,12 +329,15 @@ async def handle_command(message: dict, controller: Controller, config: dict) ->
 
     def blocking() -> dict:
         if action == "power":
-            value = message.get("value")
-            ok, detail = {
+            value = str(message.get("value") or "")
+            handler = {
                 "start": controller.start,
                 "stop": controller.stop,
                 "restart": controller.restart,
-            }[value]()
+            }.get(value)
+            if handler is None:
+                return {"ok": False, "detail": f"unknown power action: {value!r}"}
+            ok, detail = handler()
             return {"ok": ok, "detail": detail, "state": controller.state()}
         if action == "list_files":
             return {"ok": True, **list_files(server_dir, message.get("path", ""))}

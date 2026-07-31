@@ -11,12 +11,8 @@ import struct
 import time
 from typing import Any
 
-# Servers echo back their own version regardless of what we claim here, so any
-# recent protocol number works. 767 == 1.21.
 PROTOCOL_VERSION = 767
 
-# A status response is a few KB; the favicon is the only large field. The cap
-# stops a hostile host from getting us to allocate on a made-up length prefix.
 MAX_STATUS_BYTES = 512 * 1024
 
 
@@ -85,9 +81,6 @@ async def ping(host: str, port: int, timeout: float = 5.0) -> dict[str, Any]:
     started = time.perf_counter()
     writer = None
     try:
-        # One deadline over the whole exchange. Timing each read separately
-        # leaves a host that accepts the connection and then dribbles bytes
-        # (tarpits, misconfigured firewalls) able to stall the poll loop forever.
         async with asyncio.timeout(timeout):
             reader, writer = await asyncio.open_connection(host, port)
 
@@ -95,13 +88,13 @@ async def ping(host: str, port: int, timeout: float = 5.0) -> dict[str, Any]:
                 _write_varint(PROTOCOL_VERSION)
                 + _write_string(host)
                 + struct.pack(">H", port)
-                + _write_varint(1)  # next state: status
+                + _write_varint(1)
             )
             writer.write(_packet(0x00, handshake))
-            writer.write(_packet(0x00, b""))  # status request
+            writer.write(_packet(0x00, b""))
             await writer.drain()
 
-            await _read_varint(reader)  # frame length
+            await _read_varint(reader)
             packet_id = await _read_varint(reader)
             if packet_id != 0x00:
                 raise ValueError(f"unexpected packet id {packet_id}")
@@ -126,14 +119,12 @@ async def ping(host: str, port: int, timeout: float = 5.0) -> dict[str, Any]:
             "protocol": version.get("protocol"),
             "players_online": players.get("online", 0),
             "players_max": players.get("max", 0),
-            # Vanilla caps this sample at 12 names and servers may disable it.
-            # Tier 1 (`/list` over RCON) gives the authoritative roster.
             "players_sample": sample,
             "favicon": data.get("favicon"),
             "latency_ms": latency_ms,
             "error": None,
         }
-    except Exception as exc:  # offline is a normal state, not an exception path
+    except Exception as exc:
         return {
             "online": False,
             "host": host,

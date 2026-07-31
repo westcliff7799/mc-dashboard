@@ -22,14 +22,9 @@ from .config import ROOT, settings
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**14, 8, 1
 COOKIE_NAME = "mcdash_session"
 
-# Two roles still, but they now mean "who you are", not "what you may do".
-# ROLE_ADMIN is the .env owner and always holds every permission; every account
-# in users.json is ROLE_GUEST and holds exactly what it has been granted.
 ROLE_ADMIN = "admin"
 ROLE_GUEST = "guest"
 
-# Extra accounts added from the debug panel. The owner's account stays in .env,
-# so no combination of grants made here can produce a second owner.
 USERS_FILE = ROOT / "users.json"
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{2,32}$")
 MIN_PASSWORD_LENGTH = 6
@@ -76,7 +71,7 @@ def constant_time_equal(left: str, right: str) -> bool:
     try:
         return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
     except UnicodeEncodeError:
-        return False  # unencodable input cannot equal a value we produced
+        return False
 
 
 def _sign(message: str) -> str:
@@ -174,9 +169,6 @@ def load_users() -> list[dict[str, Any]]:
         if not (isinstance(entry, dict) and entry.get("username") and entry.get("password_hash")):
             continue
         normalized = dict(entry)
-        # Accounts written before permissions existed carry `role: guest` and
-        # nothing else; they come back with an empty grant, which is exactly
-        # what "read-only guest" already meant.
         normalized["permissions"] = permissions.sanitize(entry.get("permissions"))
         parsed.append(normalized)
 
@@ -205,7 +197,7 @@ def save_users(users: list[dict[str, Any]]) -> None:
     truncated store that would lock every added user out."""
     temporary = USERS_FILE.with_name(USERS_FILE.name + ".tmp")
     temporary.write_text(json.dumps({"users": users}, indent=2))
-    temporary.chmod(0o600)  # password hashes: same treatment as .env
+    temporary.chmod(0o600)
     os.replace(temporary, USERS_FILE)
 
 
@@ -280,7 +272,6 @@ def check_credentials(username: str, password: str) -> str | None:
     if settings.admin_password_hash:
         accounts[settings.admin_user] = (settings.admin_password_hash, ROLE_ADMIN)
     for entry in load_users():
-        # setdefault: the .env admin always wins a name collision.
         accounts.setdefault(entry["username"], (entry["password_hash"], ROLE_GUEST))
 
     found = accounts.get(username)

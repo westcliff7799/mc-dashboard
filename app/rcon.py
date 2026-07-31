@@ -40,8 +40,6 @@ async def execute(host: str, port: int, password: str, command: str, timeout: fl
     if not password:
         raise RconError("RCON is not configured")
 
-    # Minecraft's RCON server is single-threaded; overlapping commands from the
-    # dashboard's own clients would interleave badly.
     async with _lock:
         return await asyncio.wait_for(
             _execute_locked(host, port, password, command), timeout=timeout
@@ -54,22 +52,14 @@ async def _execute_locked(host: str, port: int, password: str, command: str) -> 
         writer.write(_encode(1, AUTH, password))
         await writer.drain()
 
-        # Some servers emit a blank RESPONSE_VALUE before the auth verdict.
         request_id, packet_type, _ = await _read_packet(reader)
         if packet_type == RESPONSE:
             request_id, packet_type, _ = await _read_packet(reader)
         if request_id == -1:
             raise RconError("RCON authentication failed — wrong password")
 
-        # Long output (e.g. /help) arrives split across packets with no length
-        # marker. Trailing an empty command lets us detect the true end: the
-        # sentinel's reply cannot arrive before the real command's last packet.
         writer.write(_encode(2, EXEC, command))
         await writer.drain()
-        # Vanilla's RCON listener reads exactly one packet per connection and
-        # drops the socket if a second packet arrives in the same TCP segment
-        # (the two small writes above otherwise get coalesced by Nagle). Let
-        # the first segment go out on its own before sending the sentinel.
         await asyncio.sleep(0.05)
         writer.write(_encode(3, EXEC, ""))
         await writer.drain()

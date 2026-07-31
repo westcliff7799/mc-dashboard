@@ -30,26 +30,20 @@ def _int(name: str, default: int) -> int:
 
 @dataclass
 class Settings:
-    # --- The Minecraft server we are watching (Tier 0) ---
     mc_host: str = field(default_factory=lambda: os.environ.get("MC_HOST", "127.0.0.1"))
     mc_port: int = field(default_factory=lambda: _int("MC_PORT", 25565))
 
-    # --- RCON (Tier 1). Blank password disables the whole feature. ---
     rcon_host: str = field(default_factory=lambda: os.environ.get("RCON_HOST", ""))
     rcon_port: int = field(default_factory=lambda: _int("RCON_PORT", 25575))
     rcon_password: str = field(default_factory=lambda: os.environ.get("RCON_PASSWORD", ""))
 
-    # --- Agent (Tier 2). Blank token disables the agent endpoint entirely. ---
     agent_token: str = field(default_factory=lambda: os.environ.get("AGENT_TOKEN", ""))
 
-    # --- Dashboard auth ---
     admin_user: str = field(default_factory=lambda: os.environ.get("ADMIN_USER", "admin"))
     admin_password_hash: str = field(
         default_factory=lambda: os.environ.get("ADMIN_PASSWORD_HASH", "")
     )
 
-    # Read-only accounts are not configured here — they're added from the debug
-    # panel and live in users.json. This stays the one full-access account.
     secret_key: str = field(
         default_factory=lambda: os.environ.get("SECRET_KEY", "") or secrets.token_hex(32)
     )
@@ -58,9 +52,6 @@ class Settings:
         default_factory=lambda: os.environ.get("SECURE_COOKIE", "true").lower() == "true"
     )
 
-    # Only turn this off-by-default flag on when something in front of the app
-    # actually rewrites the forwarded headers, or the login lockout can be
-    # sidestepped by anyone who can set them himself.
     trust_proxy_headers: bool = field(
         default_factory=lambda: os.environ.get("TRUST_PROXY_HEADERS", "false").lower() == "true"
     )

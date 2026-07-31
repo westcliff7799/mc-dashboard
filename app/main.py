@@ -20,16 +20,10 @@ STATIC = ROOT / "static"
 status_cache: dict[str, Any] = {"online": False, "error": "not polled yet", "checked_at": None}
 
 
-# --------------------------------------------------------------------------
-# background polling
-# --------------------------------------------------------------------------
-
-
 async def poll_once() -> dict[str, Any]:
     result = await ping.ping(settings.mc_host, settings.mc_port)
     result["checked_at"] = time.time()
 
-    # The ping sample is capped and often disabled; `/list` is authoritative.
     if result["online"] and settings.rcon_enabled:
         try:
             output = await rcon.execute(
@@ -65,7 +59,7 @@ async def poller() -> None:
             global status_cache
             status_cache = await poll_once()
             await hub.broadcast({"t": "status", "status": status_cache})
-        except Exception as exc:  # never let the loop die
+        except Exception as exc:
             status_cache = {"online": False, "error": str(exc), "checked_at": time.time()}
         await asyncio.sleep(settings.poll_seconds)
 
@@ -80,11 +74,6 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Minecraft Dashboard", lifespan=lifespan, docs_url=None, redoc_url=None)
-
-
-# --------------------------------------------------------------------------
-# auth plumbing
-# --------------------------------------------------------------------------
 
 
 def current_session(request: Request) -> tuple[str, str]:
@@ -168,24 +157,13 @@ async def security_headers(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
-    # Revalidate the UI every load. Without this a browser happily keeps a
-    # cached app.js after a deploy, so the page renders the new HTML against
-    # the old script — which looks exactly like a broken feature. The ETag
-    # makes the check cheap: unchanged files come back as an empty 304.
     if request.url.path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-cache"
     response.headers["Content-Security-Policy"] = (
-        # 'self' covers the ws:/wss: upgrade to this same origin; naming the bare
-        # schemes would also permit a socket to any host on the internet.
         "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
         "connect-src 'self'; base-uri 'none'; form-action 'self'"
     )
     return response
-
-
-# --------------------------------------------------------------------------
-# liveness
-# --------------------------------------------------------------------------
 
 
 @app.get("/healthz")
@@ -210,11 +188,6 @@ async def healthz():
         {"ok": alive, "poll_age_seconds": None if age is None else round(age, 1)},
         status_code=200 if alive else 503,
     )
-
-
-# --------------------------------------------------------------------------
-# pages
-# --------------------------------------------------------------------------
 
 
 @app.get("/")
@@ -259,8 +232,6 @@ async def do_login(request: Request, username: str = Form(...), password: str = 
 @app.post("/api/logout")
 async def do_logout():
     response = JSONResponse({"ok": True})
-    # The attributes have to mirror the ones used at set_cookie time or the
-    # browser keeps the original cookie alongside the expired one.
     response.delete_cookie(
         auth.COOKIE_NAME,
         httponly=True,
@@ -268,11 +239,6 @@ async def do_logout():
         secure=settings.secure_cookie,
     )
     return response
-
-
-# --------------------------------------------------------------------------
-# API
-# --------------------------------------------------------------------------
 
 
 @app.get("/api/status")
@@ -288,8 +254,6 @@ async def api_capabilities(request: Request):
         "agent": hub.connected,
         "agent_configured": settings.agent_enabled,
         "host": f"{settings.mc_host}:{settings.mc_port}",
-        # The UI hides what this account can't use. The server enforces it
-        # regardless — this is a courtesy, not the boundary.
         "role": role,
         "permissions": sorted(auth.permissions_for(user, role)),
     }
@@ -327,8 +291,6 @@ async def api_power(payload: dict, request: Request):
     if action not in {"start", "stop", "restart"}:
         raise HTTPException(400, "action must be start, stop or restart")
 
-    # Checked per action rather than as one lump: starting a stopped server is
-    # not the same favour as disconnecting everyone on a running one.
     user, role = current_session(request)
     needed = f"power.{action}"
     if needed not in auth.permissions_for(user, role):
@@ -397,10 +359,6 @@ async def api_backups(_: str = Depends(require(permissions.BACKUP_LIST))):
         raise HTTPException(502, str(exc))
 
 
-# --------------------------------------------------------------------------
-# debug panel (owner only)
-# --------------------------------------------------------------------------
-
 PM2_BIN = shutil.which("pm2") or "/usr/bin/pm2"
 
 
@@ -423,9 +381,8 @@ async def api_pm2(_: str = Depends(require(permissions.DEBUG_PM2))):
 
     try:
         async with asyncio.timeout(15):
-            raw = (await process.communicate())[0]  # stderr goes to DEVNULL
+            raw = (await process.communicate())[0]
     except TimeoutError:
-        # Don't leave a hung pm2 behind on every refresh.
         with contextlib.suppress(ProcessLookupError):
             process.kill()
         raise HTTPException(502, "pm2 did not respond within 15s")
@@ -460,10 +417,7 @@ async def api_pm2(_: str = Depends(require(permissions.DEBUG_PM2))):
 async def api_list_users(_: str = Depends(require_admin)):
     return {
         "admin": settings.admin_user,
-        # The panel renders its checkboxes from this rather than from a copy
-        # hardcoded in the JS, so the two cannot drift apart.
         "catalogue": permissions.GROUPS,
-        # Hashes stay server-side; the panel only ever needs names and grants.
         "users": [
             {"username": entry["username"], "permissions": entry["permissions"]}
             for entry in auth.load_users()
@@ -507,11 +461,6 @@ async def api_delete_user(username: str, _: str = Depends(require_admin)):
     return {"ok": True}
 
 
-# --------------------------------------------------------------------------
-# websockets
-# --------------------------------------------------------------------------
-
-
 @app.websocket("/ws")
 async def browser_socket(websocket: WebSocket):
     session = auth.validate_session(websocket.cookies.get(auth.COOKIE_NAME))
@@ -524,14 +473,12 @@ async def browser_socket(websocket: WebSocket):
     try:
         await websocket.send_json({"t": "status", "status": status_cache})
         await websocket.send_json({"t": "agent", "connected": hub.connected})
-        # The console backlog is the same data as the live feed — handing it
-        # over at connect time would undo the broadcast filter.
         if permissions.CONSOLE_VIEW in auth.permissions_for(username, role):
             await websocket.send_json({"t": "backlog", "lines": hub.recent_logs()})
         if hub.state:
             await websocket.send_json({"t": "state", "state": hub.state})
         while True:
-            await websocket.receive_text()  # client keepalives; nothing to parse
+            await websocket.receive_text()
     except WebSocketDisconnect:
         pass
     except Exception:

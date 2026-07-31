@@ -20,8 +20,6 @@ BACKUP_LIST = "backup.list"
 BACKUP_CREATE = "backup.create"
 DEBUG_PM2 = "debug.pm2"
 
-# Order here is display order in the panel. `danger` only tints the checkbox —
-# it carries no meaning on the server.
 GROUPS: list[dict[str, Any]] = [
     {
         "title": "Console",

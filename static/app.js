@@ -55,8 +55,6 @@ document.querySelectorAll('.tabs button').forEach((button) => {
     }
     if (button.dataset.tab === 'debug') {
       if (can('debug.pm2')) loadPm2();
-      // Account management is owner-only; asking as anyone else just earns a
-      // 403 and an error toast on every visit to the tab.
       if (capabilities.role === 'admin') loadUsers();
     }
   });
@@ -137,13 +135,9 @@ function applyCapabilities() {
   setTabVisible('files', seesFiles);
   setTabVisible('debug', seesDebug);
 
-  // The account-management card is the owner's alone, so it is hidden
-  // independently of the debug tab that a `debug.pm2` grant opens up.
   const userCard = $('user-list') && $('user-list').closest('.card');
   if (userCard) userCard.hidden = capabilities.role !== 'admin';
 
-  // If the active tab just got hidden, fall back to the overview rather than
-  // leaving the page showing nothing at all.
   if (!document.querySelector('.panel.active:not([hidden])')) {
     document.querySelectorAll('.tabs button').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === 'overview')));
     const overview = $('tab-overview');
@@ -672,7 +666,7 @@ $('logout').addEventListener('click', async () => {
   try {
     capabilities = await api('/api/capabilities');
     $('host').textContent = capabilities.host;
-  } catch { /* the 401 path already redirected */ }
+  } catch { }
   applyCapabilities();
   renderStatus(await api('/api/status').catch(() => null));
   connect();

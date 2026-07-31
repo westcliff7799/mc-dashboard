@@ -16,10 +16,7 @@ from . import auth, permissions
 
 MAX_LOG_LINES = 800
 REQUEST_TIMEOUT = 30.0
-# A busy server saving chunks can take well over a minute to stop cleanly, and a
-# restart pays that cost before it even begins starting up.
 POWER_TIMEOUT = 240.0
-# tar-gzipping a large world is the slowest thing the agent does.
 BACKUP_TIMEOUT = 900.0
 
 
@@ -29,11 +26,10 @@ class AgentHub:
         self.agent_connected_at: float | None = None
         self.state: dict[str, Any] = {}
         self.logs: deque[dict[str, Any]] = deque(maxlen=MAX_LOG_LINES)
-        self.browsers: dict[Any, tuple[str, str]] = {}  # websocket -> (username, role)
+        self.browsers: dict[Any, tuple[str, str]] = {}
         self._pending: dict[int, asyncio.Future] = {}
         self._next_id = 0
 
-    # ---------- agent side ----------
 
     @property
     def connected(self) -> bool:
@@ -49,7 +45,7 @@ class AgentHub:
 
     async def detach_agent(self, websocket: Any) -> None:
         if self.agent is not websocket:
-            return  # a superseded agent shutting down; ignore
+            return
         self.agent = None
         self.agent_connected_at = None
         self.state = {}
@@ -81,8 +77,6 @@ class AgentHub:
         kind = message.get("t")
 
         if kind == "result":
-            # The id arrives over the wire, so it is whatever the agent sent —
-            # anything but an int can't match a pending request anyway.
             request_id = message.get("id")
             future = self._pending.get(request_id) if isinstance(request_id, int) else None
             if future and not future.done():
@@ -100,7 +94,6 @@ class AgentHub:
             self.state = message.get("state", {})
             await self.broadcast({"t": "state", "state": self.state})
 
-    # ---------- browser side ----------
 
     def add_browser(self, websocket: Any, username: str, role: str) -> None:
         self.browsers[websocket] = (username, role)
