@@ -7,8 +7,6 @@ let socket = null;
 let backoff = 1000;
 let currentDir = '';
 
-// ---------------------------------------------------------------- helpers
-
 function toast(message, bad = false) {
   const el = $('toast');
   el.textContent = message;
@@ -30,8 +28,6 @@ function clock(ts) {
   return ts ? new Date(ts * 1000).toLocaleTimeString() : '';
 }
 
-// Stat-tile contract: group thousands, compact past 5 digits so the hero
-// figure can't outgrow its tile.
 function count(n) {
   if (!Number.isFinite(n)) return '—';
   return n >= 100000
@@ -47,8 +43,6 @@ async function api(path, options = {}) {
   return data;
 }
 
-// ---------------------------------------------------------------- tabs
-
 document.querySelectorAll('.tabs button').forEach((button) => {
   button.addEventListener('click', () => {
     document.querySelectorAll('.tabs button')
@@ -59,17 +53,17 @@ document.querySelectorAll('.tabs button').forEach((button) => {
       loadFiles(currentDir);
       loadBackups();
     }
+    if (button.dataset.tab === 'debug') {
+      loadPm2();
+      loadUsers();
+    }
   });
 });
-
-// ---------------------------------------------------------------- rendering
 
 function renderStatus(status) {
   if (!status) return;
 
   const pill = $('status-pill');
-  // Glyph + word carry the state; colour is a third, redundant cue, so the
-  // pill still reads correctly in greyscale or with any colour vision.
   pill.className = `pill ${status.online ? 'good' : 'critical'}`;
   $('status-icon').textContent = status.online ? '✓' : '✕';
   $('status-text').textContent = status.online ? 'Online' : 'Offline';
@@ -97,7 +91,7 @@ function renderStatus(status) {
     names.forEach((name) => {
       const span = document.createElement('span');
       span.className = 'player';
-      span.textContent = name;          // textContent, never innerHTML — names are untrusted
+      span.textContent = name;
       players.appendChild(span);
     });
   }
@@ -122,6 +116,18 @@ function renderAgentState(state) {
 
 function applyCapabilities() {
   const agent = capabilities.agent;
+
+  if (capabilities.role === 'guest') {
+    document.querySelectorAll('.tabs [data-tab="console"], .tabs [data-tab="files"], .tabs [data-tab="debug"]')
+      .forEach((tab) => { tab.hidden = true; });
+    ['tab-console', 'tab-files', 'tab-debug'].forEach((id) => {
+      const panel = $(id);
+      if (panel) { panel.hidden = true; panel.classList.remove('active'); }
+    });
+    const power = $('power-card') || $('btn-start').closest('.card');
+    if (power) power.hidden = true;
+    return;
+  }
 
   ['btn-start', 'btn-restart', 'btn-stop', 'btn-backup'].forEach((id) => { $(id).disabled = !agent; });
   $('power-unavailable').hidden = agent;
@@ -149,13 +155,9 @@ function applyCapabilities() {
   if (!agent) renderAgentState(null);
 }
 
-// ---------------------------------------------------------------- console
-
 const consoleEl = $('console');
 
 function appendLine(entry) {
-  // Autoscroll only when already pinned to the bottom, so reading scrollback
-  // isn't yanked away by incoming lines.
   const pinned = consoleEl.scrollHeight - consoleEl.scrollTop - consoleEl.clientHeight < 40;
 
   const line = document.createElement('span');
@@ -165,7 +167,7 @@ function appendLine(entry) {
     else if (/\bWARN\b/.test(entry.line)) kind = 'warn';
   }
   line.className = `l ${kind}`.trim();
-  line.textContent = entry.line;         // untrusted server output — never innerHTML
+  line.textContent = entry.line;
   consoleEl.appendChild(line);
 
   while (consoleEl.childElementCount > 1000) consoleEl.removeChild(consoleEl.firstChild);
@@ -188,8 +190,6 @@ $('cmdform').addEventListener('submit', async (event) => {
     appendLine({ line: `! ${error.message}`, kind: 'err' });
   }
 });
-
-// ---------------------------------------------------------------- power
 
 async function power(action) {
   if (action !== 'start' &&
@@ -217,8 +217,6 @@ async function power(action) {
 $('btn-start').addEventListener('click', () => power('start'));
 $('btn-stop').addEventListener('click', () => power('stop'));
 $('btn-restart').addEventListener('click', () => power('restart'));
-
-// ---------------------------------------------------------------- files
 
 async function loadFiles(path) {
   const table = $('file-table');
@@ -341,8 +339,6 @@ $('btn-backup').addEventListener('click', async () => {
   }
 });
 
-// ---------------------------------------------------------------- websocket
-
 function connect() {
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
   socket = new WebSocket(`${scheme}://${location.host}/ws`);
@@ -383,6 +379,155 @@ function connect() {
 
   socket.addEventListener('error', () => socket.close());
 }
+
+function duration(seconds) {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}d`;
+}
+
+function row(cells) {
+  const tr = document.createElement('tr');
+  cells.forEach(([text, className]) => {
+    const td = document.createElement('td');
+    if (className) td.className = className;
+    td.textContent = text;
+    tr.appendChild(td);
+  });
+  return tr;
+}
+
+const PM2_COLUMNS = [
+  ['id', 3, 'right'],
+  ['name', 24, 'left'],
+  ['status', 9, 'left'],
+  ['↺', 6, 'right'],
+  ['cpu', 6, 'right'],
+  ['memory', 10, 'right'],
+  ['uptime', 8, 'right'],
+];
+const PM2_STATUS_INDEX = 2;
+
+function fit(value, width, align) {
+  let text = value == null ? '—' : String(value);
+  if (text.length > width) text = `${text.slice(0, width - 1)}…`;
+  return align === 'right' ? text.padStart(width) : text.padEnd(width);
+}
+
+function pm2Rule(left, middle, right) {
+  return left + PM2_COLUMNS.map(([, width]) => '─'.repeat(width + 2)).join(middle) + right + '\n';
+}
+
+function pm2Row(target, values, colourStatus) {
+  target.appendChild(document.createTextNode('│ '));
+  PM2_COLUMNS.forEach(([, width, align], index) => {
+    const text = fit(values[index], width, align);
+    if (colourStatus && index === PM2_STATUS_INDEX) {
+      const span = document.createElement('span');
+      const status = String(values[index]);
+      span.className = `st ${status === 'online' ? 'ok' : status === 'errored' ? 'bad' : 'busy'}`;
+      span.textContent = text;
+      target.appendChild(span);
+    } else {
+      target.appendChild(document.createTextNode(text));
+    }
+    target.appendChild(document.createTextNode(index === PM2_COLUMNS.length - 1 ? ' │\n' : ' │ '));
+  });
+}
+
+async function loadPm2() {
+  const out = $('pm2-out');
+  let data;
+  try {
+    data = await api('/api/admin/pm2');
+  } catch (error) {
+    out.classList.add('err');
+    out.textContent = `error: ${error.message}`;
+    return;
+  }
+  out.classList.remove('err');
+  out.textContent = '';
+
+  const processes = data.processes || [];
+  if (!processes.length) {
+    out.textContent = 'pm2 is running but has no processes.';
+    return;
+  }
+
+  out.appendChild(document.createTextNode(pm2Rule('┌', '┬', '┐')));
+  pm2Row(out, PM2_COLUMNS.map(([label]) => label), false);
+  out.appendChild(document.createTextNode(pm2Rule('├', '┼', '┤')));
+  processes.forEach((process) => {
+    pm2Row(out, [
+      process.id,
+      process.name,
+      process.status,
+      process.restarts,
+      process.cpu == null ? null : `${process.cpu}%`,
+      process.memory_mb == null ? null : `${process.memory_mb}mb`,
+      process.uptime_seconds == null ? null : duration(process.uptime_seconds),
+    ], true);
+  });
+  out.appendChild(document.createTextNode(pm2Rule('└', '┴', '┘')));
+}
+
+async function loadUsers() {
+  const table = $('user-table');
+  try {
+    const data = await api('/api/admin/users');
+    table.innerHTML = '<tr><th>User</th><th>Access</th><th></th></tr>';
+    table.appendChild(row([[data.admin, 'name'], ['admin — full access', ''], ['', '']]));
+
+    if (!(data.users || []).length) {
+      const empty = document.createElement('tr');
+      empty.innerHTML = '<td colspan="3" class="empty">No read-only users yet.</td>';
+      table.appendChild(empty);
+      return;
+    }
+    data.users.forEach((user) => {
+      const tr = row([[user.username, 'name'], ['read-only', ''], ['', '']]);
+      const button = document.createElement('button');
+      button.className = 'action danger';
+      button.textContent = 'Remove';
+      button.addEventListener('click', async () => {
+        if (!confirm(`Remove ${user.username}?`)) return;
+        try {
+          await api(`/api/admin/users/${encodeURIComponent(user.username)}`, { method: 'DELETE' });
+          toast(`Removed ${user.username}`);
+          loadUsers();
+        } catch (error) {
+          toast(error.message, true);
+        }
+      });
+      tr.lastChild.appendChild(button);
+      table.appendChild(tr);
+    });
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+$('btn-pm2-refresh').addEventListener('click', loadPm2);
+
+$('userform').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const username = $('new-username').value.trim();
+  const password = $('new-password').value;
+  try {
+    await api('/api/admin/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    $('new-username').value = '';
+    $('new-password').value = '';
+    toast(`Added ${username}`);
+    loadUsers();
+  } catch (error) {
+    toast(error.message, true);
+  }
+});
 
 $('logout').addEventListener('click', async () => {
   await fetch('/api/logout', { method: 'POST' });

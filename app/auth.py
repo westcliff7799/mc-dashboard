@@ -9,13 +9,26 @@ per-IP lockout so the password can't be ground down by brute force.
 import base64
 import hashlib
 import hmac
+import json
+import os
+import re
 import secrets
 import time
 
-from .config import settings
+from .config import ROOT, settings
 
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**14, 8, 1
 COOKIE_NAME = "mcdash_session"
+
+ROLE_ADMIN = "admin"
+ROLE_GUEST = "guest"
+
+# Extra accounts added from the debug panel. The owner's account stays in .env
+# and is the only admin — everything in this file is read-only, so a mistake in
+# the panel can't produce someone who can stop the server.
+USERS_FILE = ROOT / "users.json"
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{2,32}$")
+MIN_PASSWORD_LENGTH = 12
 
 MAX_ATTEMPTS = 8
 LOCKOUT_SECONDS = 900
@@ -67,28 +80,36 @@ def _sign(message: str) -> str:
     return base64.urlsafe_b64encode(signature).decode().rstrip("=")
 
 
-def issue_session(username: str) -> str:
-    """Stateless signed token, so a dashboard restart doesn't log you out."""
+def issue_session(username: str, role: str) -> str:
+    """Stateless signed token, so a dashboard restart doesn't log you out.
+
+    The role is inside the signed message, not alongside it. A guest editing
+    their own cookie to say "admin" changes the message, so the signature stops
+    matching and the session is rejected outright.
+    """
     expires = int(time.time()) + settings.session_hours * 3600
-    message = f"{username}:{expires}"
+    message = f"{username}:{role}:{expires}"
     return f"{message}:{_sign(message)}"
 
 
-def validate_session(token: str | None) -> str | None:
+def validate_session(token: str | None) -> tuple[str, str] | None:
+    """Return (username, role), or None if the token is bad or expired."""
     if not token:
         return None
     try:
-        username, expires_raw, signature = token.rsplit(":", 2)
+        username, role, expires_raw, signature = token.rsplit(":", 3)
     except ValueError:
         return None
-    if not constant_time_equal(signature, _sign(f"{username}:{expires_raw}")):
+    if not constant_time_equal(signature, _sign(f"{username}:{role}:{expires_raw}")):
+        return None
+    if role not in (ROLE_ADMIN, ROLE_GUEST):
         return None
     try:
         if int(expires_raw) < time.time():
             return None
     except ValueError:
         return None
-    return username
+    return username, role
 
 
 def throttle_check(client_ip: str) -> int:
@@ -109,11 +130,86 @@ def clear_failures(client_ip: str) -> None:
     _attempts.pop(client_ip, None)
 
 
-def check_credentials(username: str, password: str) -> bool:
-    if not settings.admin_password_hash:
+def load_users() -> list[dict[str, str]]:
+    """Read the added-user store. Never raises — a corrupt or missing file
+    must not lock the owner out of their own dashboard."""
+    try:
+        data = json.loads(USERS_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return []
+    entries = data.get("users") if isinstance(data, dict) else None
+    return [
+        entry
+        for entry in (entries or [])
+        if isinstance(entry, dict) and entry.get("username") and entry.get("password_hash")
+    ]
+
+
+def save_users(users: list[dict[str, str]]) -> None:
+    """Write via a temp file and rename, so a crash mid-write can't leave a
+    truncated store that would lock every added user out."""
+    temporary = USERS_FILE.with_name(USERS_FILE.name + ".tmp")
+    temporary.write_text(json.dumps({"users": users}, indent=2))
+    temporary.chmod(0o600)  # password hashes: same treatment as .env
+    os.replace(temporary, USERS_FILE)
+
+
+def add_user(username: str, password: str) -> None:
+    """Add a read-only account. Raises ValueError with a message fit to show."""
+    username = username.strip()
+    if not USERNAME_PATTERN.match(username):
+        raise ValueError("Username must be 2-32 characters: letters, digits, dot, dash, underscore.")
+    if username.lower() == settings.admin_user.lower():
+        raise ValueError("That name belongs to the admin account.")
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise ValueError(f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
+
+    users = load_users()
+    if any(existing["username"].lower() == username.lower() for existing in users):
+        raise ValueError("That user already exists.")
+    users.append(
+        {"username": username, "role": ROLE_GUEST, "password_hash": hash_password(password)}
+    )
+    save_users(users)
+
+
+def delete_user(username: str) -> bool:
+    users = load_users()
+    remaining = [entry for entry in users if entry["username"] != username]
+    if len(remaining) == len(users):
         return False
-    # Compare both fields even when the username is wrong, so response timing
-    # doesn't reveal whether the username exists.
-    user_ok = constant_time_equal(username, settings.admin_user)
-    pass_ok = verify_password(password, settings.admin_password_hash)
-    return user_ok and pass_ok
+    save_users(remaining)
+    return True
+
+
+_dummy_hash: str | None = None
+
+
+def check_credentials(username: str, password: str) -> str | None:
+    """Return the role this username/password pair grants, or None.
+
+    Exactly one scrypt verification runs per attempt, whether or not the
+    username exists — an unknown name is checked against a throwaway hash. That
+    keeps the response time flat (so it doesn't answer "does this account
+    exist?") without re-hashing once per account, which would make login slower
+    with every user added.
+    """
+    global _dummy_hash
+
+    accounts: dict[str, tuple[str, str]] = {}
+    if settings.admin_password_hash:
+        accounts[settings.admin_user] = (settings.admin_password_hash, ROLE_ADMIN)
+    for entry in load_users():
+        # setdefault: the .env admin always wins a name collision.
+        accounts.setdefault(entry["username"], (entry["password_hash"], ROLE_GUEST))
+
+    found = accounts.get(username)
+    if found is None:
+        if _dummy_hash is None:
+            _dummy_hash = hash_password(secrets.token_urlsafe(32))
+        stored_hash, role = _dummy_hash, None
+    else:
+        stored_hash, role = found
+
+    password_ok = verify_password(password, stored_hash)
+    return role if (password_ok and role) else None

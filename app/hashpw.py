@@ -3,6 +3,7 @@
     python -m app.hashpw
 
 Reads the password from a hidden prompt so it never lands in shell history.
+Read-only accounts aren't made here — add those from the dashboard's Debug tab.
 """
 
 import getpass

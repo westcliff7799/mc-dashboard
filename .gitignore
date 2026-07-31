@@ -3,3 +3,4 @@
 __pycache__/
 *.pyc
 agent/agent.conf
+users.json

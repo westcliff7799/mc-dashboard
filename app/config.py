@@ -47,6 +47,9 @@ class Settings:
     admin_password_hash: str = field(
         default_factory=lambda: os.environ.get("ADMIN_PASSWORD_HASH", "")
     )
+
+    # Read-only accounts are not configured here — they're added from the debug
+    # panel and live in users.json. This stays the one full-access account.
     secret_key: str = field(
         default_factory=lambda: os.environ.get("SECRET_KEY", "") or secrets.token_hex(32)
     )
@@ -71,6 +74,7 @@ class Settings:
     @property
     def agent_enabled(self) -> bool:
         return bool(self.agent_token)
+
 
     @property
     def effective_rcon_host(self) -> str:

@@ -2,6 +2,8 @@
 
 import asyncio
 import contextlib
+import json
+import shutil
 import time
 from typing import Any
 
@@ -85,10 +87,27 @@ app = FastAPI(title="Minecraft Dashboard", lifespan=lifespan, docs_url=None, red
 # --------------------------------------------------------------------------
 
 
-def current_user(request: Request) -> str:
-    user = auth.validate_session(request.cookies.get(auth.COOKIE_NAME))
-    if not user:
+def current_session(request: Request) -> tuple[str, str]:
+    session = auth.validate_session(request.cookies.get(auth.COOKIE_NAME))
+    if not session:
         raise HTTPException(status_code=401, detail="not authenticated")
+    return session
+
+
+def current_user(request: Request) -> str:
+    """Any signed-in account, guest included. Read-only views only."""
+    return current_session(request)[0]
+
+
+def require_admin(request: Request) -> str:
+    """Anything that can change the server, read its files, or see its console.
+
+    The role comes out of the signed session token, so this cannot be talked
+    into passing by editing a cookie.
+    """
+    user, role = current_session(request)
+    if role != auth.ROLE_ADMIN:
+        raise HTTPException(status_code=403, detail="this account is read-only")
     return user
 
 
@@ -129,6 +148,12 @@ async def security_headers(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
+    # Revalidate the UI every load. Without this a browser happily keeps a
+    # cached app.js after a deploy, so the page renders the new HTML against
+    # the old script — which looks exactly like a broken feature. The ETag
+    # makes the check cheap: unchanged files come back as an empty 304.
+    if request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
     response.headers["Content-Security-Policy"] = (
         # 'self' covers the ws:/wss: upgrade to this same origin; naming the bare
         # schemes would also permit a socket to any host on the internet.
@@ -193,15 +218,16 @@ async def do_login(request: Request, username: str = Form(...), password: str = 
     if not settings.admin_password_hash:
         raise HTTPException(500, "ADMIN_PASSWORD_HASH is not set — run `python -m app.hashpw`.")
 
-    if not auth.check_credentials(username, password):
+    role = auth.check_credentials(username, password)
+    if role is None:
         auth.record_failure(ip)
         raise HTTPException(401, "Invalid credentials")
 
     auth.clear_failures(ip)
-    response = JSONResponse({"ok": True})
+    response = JSONResponse({"ok": True, "role": role})
     response.set_cookie(
         auth.COOKIE_NAME,
-        auth.issue_session(username),
+        auth.issue_session(username, role),
         max_age=settings.session_hours * 3600,
         httponly=True,
         samesite="lax",
@@ -235,17 +261,21 @@ async def api_status(_: str = Depends(current_user)):
 
 
 @app.get("/api/capabilities")
-async def api_capabilities(_: str = Depends(current_user)):
+async def api_capabilities(request: Request):
+    _, role = current_session(request)
     return {
         "rcon": settings.rcon_enabled,
         "agent": hub.connected,
         "agent_configured": settings.agent_enabled,
         "host": f"{settings.mc_host}:{settings.mc_port}",
+        # The UI hides what this account can't use. The server enforces it
+        # regardless — this is a courtesy, not the boundary.
+        "role": role,
     }
 
 
 @app.post("/api/command")
-async def api_command(payload: dict, user: str = Depends(current_user)):
+async def api_command(payload: dict, user: str = Depends(require_admin)):
     command = (payload.get("command") or "").strip().lstrip("/")
     if not command:
         raise HTTPException(400, "empty command")
@@ -259,15 +289,19 @@ async def api_command(payload: dict, user: str = Depends(current_user)):
         raise HTTPException(502, f"RCON failed: {exc}")
 
     await hub.broadcast(
-        {"t": "log", "ts": time.time(), "line": f"[{user}] > /{command}", "kind": "echo"}
+        {"t": "log", "ts": time.time(), "line": f"[{user}] > /{command}", "kind": "echo"},
+        roles=agenthub.ADMIN_ONLY,
     )
     if output:
-        await hub.broadcast({"t": "log", "ts": time.time(), "line": output, "kind": "reply"})
+        await hub.broadcast(
+            {"t": "log", "ts": time.time(), "line": output, "kind": "reply"},
+            roles=agenthub.ADMIN_ONLY,
+        )
     return {"ok": True, "output": output}
 
 
 @app.post("/api/power")
-async def api_power(payload: dict, user: str = Depends(current_user)):
+async def api_power(payload: dict, user: str = Depends(require_admin)):
     action = payload.get("action")
     if action not in {"start", "stop", "restart"}:
         raise HTTPException(400, "action must be start, stop or restart")
@@ -278,18 +312,19 @@ async def api_power(payload: dict, user: str = Depends(current_user)):
     except Exception as exc:
         raise HTTPException(502, str(exc))
     await hub.broadcast(
-        {"t": "log", "ts": time.time(), "line": f"[{user}] requested {action}", "kind": "echo"}
+        {"t": "log", "ts": time.time(), "line": f"[{user}] requested {action}", "kind": "echo"},
+        roles=agenthub.ADMIN_ONLY,
     )
     return result
 
 
 @app.get("/api/logs")
-async def api_logs(_: str = Depends(current_user)):
+async def api_logs(_: str = Depends(require_admin)):
     return {"lines": hub.recent_logs()}
 
 
 @app.get("/api/files")
-async def api_files(path: str = "", _: str = Depends(current_user)):
+async def api_files(path: str = "", _: str = Depends(require_admin)):
     if not hub.connected:
         raise HTTPException(409, "the agent is not connected — file access is unavailable")
     try:
@@ -299,7 +334,7 @@ async def api_files(path: str = "", _: str = Depends(current_user)):
 
 
 @app.get("/api/files/read")
-async def api_file_read(path: str, _: str = Depends(current_user)):
+async def api_file_read(path: str, _: str = Depends(require_admin)):
     if not hub.connected:
         raise HTTPException(409, "the agent is not connected — file access is unavailable")
     try:
@@ -309,7 +344,7 @@ async def api_file_read(path: str, _: str = Depends(current_user)):
 
 
 @app.post("/api/backup")
-async def api_backup(user: str = Depends(current_user)):
+async def api_backup(user: str = Depends(require_admin)):
     if not hub.connected:
         raise HTTPException(409, "the agent is not connected — backups are unavailable")
     try:
@@ -317,13 +352,14 @@ async def api_backup(user: str = Depends(current_user)):
     except Exception as exc:
         raise HTTPException(502, str(exc))
     await hub.broadcast(
-        {"t": "log", "ts": time.time(), "line": f"[{user}] triggered a backup", "kind": "echo"}
+        {"t": "log", "ts": time.time(), "line": f"[{user}] triggered a backup", "kind": "echo"},
+        roles=agenthub.ADMIN_ONLY,
     )
     return result
 
 
 @app.get("/api/backups")
-async def api_backups(_: str = Depends(current_user)):
+async def api_backups(_: str = Depends(require_admin)):
     if not hub.connected:
         raise HTTPException(409, "the agent is not connected")
     try:
@@ -333,21 +369,113 @@ async def api_backups(_: str = Depends(current_user)):
 
 
 # --------------------------------------------------------------------------
+# debug panel (owner only)
+# --------------------------------------------------------------------------
+
+PM2_BIN = shutil.which("pm2") or "/usr/bin/pm2"
+
+
+@app.get("/api/admin/pm2")
+async def api_pm2(_: str = Depends(require_admin)):
+    """PM2 process table.
+
+    Only the handful of fields below are passed through. `pm2 jlist` embeds
+    each process's entire environment under pm2_env, so returning the raw
+    output would hand over every secret those processes were started with.
+    """
+    try:
+        process = await asyncio.create_subprocess_exec(
+            PM2_BIN, "jlist",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        raise HTTPException(502, f"could not run pm2: {type(exc).__name__}")
+
+    try:
+        async with asyncio.timeout(15):
+            raw = (await process.communicate())[0]  # stderr goes to DEVNULL
+    except TimeoutError:
+        # Don't leave a hung pm2 behind on every refresh.
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        raise HTTPException(502, "pm2 did not respond within 15s")
+
+    try:
+        entries = json.loads(raw or b"[]")
+    except json.JSONDecodeError:
+        raise HTTPException(502, "pm2 returned output that wasn't JSON")
+
+    now = time.time()
+    processes = []
+    for entry in entries:
+        environment = entry.get("pm2_env") or {}
+        monitor = entry.get("monit") or {}
+        started_ms = environment.get("pm_uptime")
+        processes.append(
+            {
+                "id": entry.get("pm_id"),
+                "name": entry.get("name"),
+                "status": environment.get("status"),
+                "pid": entry.get("pid"),
+                "restarts": environment.get("restart_time"),
+                "cpu": monitor.get("cpu"),
+                "memory_mb": round((monitor.get("memory") or 0) / 1048576, 1),
+                "uptime_seconds": round(now - started_ms / 1000) if started_ms else None,
+            }
+        )
+    return {"processes": processes}
+
+
+@app.get("/api/admin/users")
+async def api_list_users(_: str = Depends(require_admin)):
+    return {
+        "admin": settings.admin_user,
+        # Hashes stay server-side; the panel only ever needs the names.
+        "users": [
+            {"username": entry["username"], "role": entry.get("role", auth.ROLE_GUEST)}
+            for entry in auth.load_users()
+        ],
+    }
+
+
+@app.post("/api/admin/users")
+async def api_add_user(payload: dict, _: str = Depends(require_admin)):
+    try:
+        auth.add_user(str(payload.get("username", "")), str(payload.get("password", "")))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True}
+
+
+@app.delete("/api/admin/users/{username}")
+async def api_delete_user(username: str, _: str = Depends(require_admin)):
+    if not auth.delete_user(username):
+        raise HTTPException(404, "no such user")
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------
 # websockets
 # --------------------------------------------------------------------------
 
 
 @app.websocket("/ws")
 async def browser_socket(websocket: WebSocket):
-    if not auth.validate_session(websocket.cookies.get(auth.COOKIE_NAME)):
+    session = auth.validate_session(websocket.cookies.get(auth.COOKIE_NAME))
+    if not session:
         await websocket.close(code=4401, reason="not authenticated")
         return
+    _, role = session
     await websocket.accept()
-    hub.add_browser(websocket)
+    hub.add_browser(websocket, role)
     try:
         await websocket.send_json({"t": "status", "status": status_cache})
         await websocket.send_json({"t": "agent", "connected": hub.connected})
-        await websocket.send_json({"t": "backlog", "lines": hub.recent_logs()})
+        # The console backlog is the same admin-only data as the live feed —
+        # handing it over at connect time would undo the broadcast filter.
+        if role == auth.ROLE_ADMIN:
+            await websocket.send_json({"t": "backlog", "lines": hub.recent_logs()})
         if hub.state:
             await websocket.send_json({"t": "state", "state": hub.state})
         while True:

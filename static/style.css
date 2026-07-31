@@ -230,6 +230,26 @@ button.action.primary { background: var(--accent); border-color: var(--accent); 
   white-space: pre-wrap;
   word-break: break-word;
 }
+#pm2-out {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  background: var(--page);
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  padding: 12px;
+  margin: 0;
+  /* The table is drawn with box characters, so it must not wrap — it scrolls
+     sideways on a narrow screen instead of folding into nonsense. */
+  white-space: pre;
+  overflow-x: auto;
+  color: var(--text-secondary);
+}
+#pm2-out .st.ok   { color: var(--good); font-weight: 600; }
+#pm2-out .st.bad  { color: var(--critical); font-weight: 600; }
+#pm2-out .st.busy { color: var(--warning); font-weight: 600; }
+#pm2-out.err      { color: var(--critical); }
+
 #console .l { display: block; }
 #console .l.echo  { color: var(--accent); font-weight: 600; }
 #console .l.reply { color: var(--text-secondary); }

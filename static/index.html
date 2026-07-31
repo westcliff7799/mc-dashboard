@@ -21,6 +21,7 @@
       <button role="tab" aria-selected="true"  data-tab="overview">Overview</button>
       <button role="tab" aria-selected="false" data-tab="console">Console</button>
       <button role="tab" aria-selected="false" data-tab="files">Files &amp; backups</button>
+      <button role="tab" aria-selected="false" data-tab="debug">Debug</button>
     </div>
 
     <!-- ---------------- Overview ---------------- -->
@@ -112,6 +113,30 @@
         <div class="crumbs" id="crumbs"></div>
         <table class="files" id="file-table"></table>
         <pre class="viewer" id="viewer" hidden></pre>
+      </div>
+    </section>
+
+    <!-- ---------------- Debug (owner only) ---------------- -->
+    <section class="panel" id="tab-debug">
+      <div class="card">
+        <h2>PM2 processes</h2>
+        <pre id="pm2-out" role="log" aria-label="PM2 process table">loading…</pre>
+        <button class="action" id="btn-pm2-refresh" style="margin-top:12px">Refresh</button>
+      </div>
+
+      <div class="card">
+        <h2>Read-only users</h2>
+        <p class="sub">These accounts see the overview only — no console, no
+          commands, no files. Your admin account lives in <code>.env</code> and
+          can't be changed from here.</p>
+        <table class="files" id="user-table"></table>
+        <form class="cmdbar" id="userform" style="margin-top:12px">
+          <input id="new-username" placeholder="username" autocomplete="off"
+                 spellcheck="false" aria-label="New username">
+          <input id="new-password" type="password" placeholder="password (12+ characters)"
+                 autocomplete="new-password" aria-label="New password">
+          <button class="action primary" type="submit" id="btn-add-user">Add user</button>
+        </form>
       </div>
     </section>
   </main>

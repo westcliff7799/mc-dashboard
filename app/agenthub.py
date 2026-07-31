@@ -12,6 +12,9 @@ import time
 from collections import deque
 from typing import Any
 
+# Console output and command echoes go to admins only; see broadcast().
+ADMIN_ONLY = {"admin"}
+
 MAX_LOG_LINES = 800
 REQUEST_TIMEOUT = 30.0
 # A busy server saving chunks can take well over a minute to stop cleanly, and a
@@ -27,7 +30,7 @@ class AgentHub:
         self.agent_connected_at: float | None = None
         self.state: dict[str, Any] = {}
         self.logs: deque[dict[str, Any]] = deque(maxlen=MAX_LOG_LINES)
-        self.browsers: set[Any] = set()
+        self.browsers: dict[Any, str] = {}  # websocket -> role
         self._pending: dict[int, asyncio.Future] = {}
         self._next_id = 0
 
@@ -79,7 +82,10 @@ class AgentHub:
         kind = message.get("t")
 
         if kind == "result":
-            future = self._pending.get(message.get("id"))
+            # The id arrives over the wire, so it is whatever the agent sent —
+            # anything but an int can't match a pending request anyway.
+            request_id = message.get("id")
+            future = self._pending.get(request_id) if isinstance(request_id, int) else None
             if future and not future.done():
                 future.set_result(message)
 
@@ -89,7 +95,7 @@ class AgentHub:
                     continue
                 entry = {"ts": message.get("ts") or time.time(), "line": line}
                 self.logs.append(entry)
-                await self.broadcast({"t": "log", **entry})
+                await self.broadcast({"t": "log", **entry}, roles=ADMIN_ONLY)
 
         elif kind == "state":
             self.state = message.get("state", {})
@@ -97,23 +103,32 @@ class AgentHub:
 
     # ---------- browser side ----------
 
-    def add_browser(self, websocket: Any) -> None:
-        self.browsers.add(websocket)
+    def add_browser(self, websocket: Any, role: str) -> None:
+        self.browsers[websocket] = role
 
     def discard_browser(self, websocket: Any) -> None:
-        self.browsers.discard(websocket)
+        self.browsers.pop(websocket, None)
 
-    async def broadcast(self, payload: dict[str, Any]) -> None:
+    async def broadcast(self, payload: dict[str, Any], roles: set[str] | None = None) -> None:
+        """Send to every browser, or only those holding one of `roles`.
+
+        Console lines and command echoes are admin-only. Blocking the REST
+        endpoints is not enough on its own — without this filter a read-only
+        guest would still watch the server console, and every command an admin
+        ran, stream past on their socket.
+        """
         if not self.browsers:
             return
         dead = []
-        for websocket in list(self.browsers):
+        for websocket, role in list(self.browsers.items()):
+            if roles is not None and role not in roles:
+                continue
             try:
                 await websocket.send_json(payload)
             except Exception:
                 dead.append(websocket)
         for websocket in dead:
-            self.browsers.discard(websocket)
+            self.browsers.pop(websocket, None)
 
     def recent_logs(self, limit: int = 300) -> list[dict[str, Any]]:
         return list(self.logs)[-limit:]
