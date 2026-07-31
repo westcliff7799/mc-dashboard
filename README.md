@@ -64,11 +64,13 @@ headers itself instead: only from a loopback peer, preferring Cloudflare's
 you set `TRUST_PROXY_HEADERS=true`, which you should do only once the tunnel
 below is actually in front.
 
-Then install the service and the supervision around it:
+Then start it under PM2 and make it survive reboots:
 
 ```bash
-sudo deploy/install-supervision.sh
-journalctl -u mc-dashboard -f
+pm2 start ecosystem.config.js
+pm2 save                  # records it in the boot list
+pm2 startup               # only needed once per machine; prints a sudo line to run
+sudo deploy/install-machine-watchdog.sh
 ```
 
 Note it binds to `127.0.0.1` — the tunnel below is the only way in.
@@ -79,38 +81,56 @@ Four layers, each catching what the one below it can't:
 
 | Failure | What catches it |
 | --- | --- |
-| Process exits or crashes | `Restart=always`, with `StartLimitIntervalSec=0` so systemd never gives up |
-| Process alive but wedged | `/healthz` + the supervisor timer — 3 bad probes in a row triggers a restart |
-| You edited the code | Same timer notices the change and restarts, *after* checking it imports |
+| Process exits or crashes | PM2 `autorestart`, with a very high `max_restarts` so it never parks in `errored` |
+| Process alive but **wedged** | `/healthz` + `mc-dashboard-supervisor` — 3 bad probes in a row triggers a restart |
+| You edited the code | Same supervisor notices, and restarts *after* checking the new code imports |
 | Kernel hang, OOM freeze, panic | BCM2835 hardware watchdog + `kernel.panic=10` |
 
-The one that isn't obvious is the second. `Restart=always` only fires when the
-process *exits* — an event loop that has wedged keeps the process alive and the
-unit `active` while it serves nothing at all, and systemd is perfectly happy.
-So `/healthz` reports whether the poll loop is still turning, and the supervisor
-restarts on that rather than on liveness of the process.
+The one that isn't obvious is the second, and it's why there are two PM2
+processes instead of one. `autorestart` only fires when the process *exits* — an
+event loop that has wedged keeps the process alive and PM2 reporting `online`
+while it serves nothing at all. (You can see this for yourself: `kill -STOP` the
+dashboard's pid, and `pm2 list` will happily keep showing `online`.) So
+`/healthz` reports whether the poll loop is still turning, and the supervisor
+restarts on *that* rather than on liveness of the process. Worst case from wedge
+to recovery is `FAIL_THRESHOLD * (PROBE_TIMEOUT + INTERVAL)` — about 45s.
 
 Two deliberate refusals in `deploy/supervise.sh`:
 
-- **It won't restart into code that doesn't import.** A half-finished save would
-  otherwise take the dashboard down and leave systemd restart-looping on it. The
-  running version stays up until the code is valid again.
-- **It won't restart a unit you stopped by hand.** `systemctl stop` means you
-  wanted it stopped; only the `failed` state gets recovered.
+- **It won't restart into code that doesn't import.** This is why PM2's own
+  `watch` is off: it would bounce straight into a half-finished save and leave
+  you with nothing running. The running version stays up until the code is valid
+  again, and the reason lands in the supervisor's log.
+- **It won't restart something you stopped by hand.** `pm2 stop` means you wanted
+  it stopped; only the `errored` status gets recovered.
 
-The watchdog needs a reboot to arm. Confirm it afterwards:
+Useful commands:
 
 ```bash
-journalctl -b | grep -i watchdog        # "Watchdog running with a timeout of 14s"
-systemctl list-timers mc-dashboard-supervise.timer
+pm2 logs mc-dashboard-supervisor     # why it restarted anything
+pm2 logs mc-dashboard                # the app itself
+pm2 restart ecosystem.config.js --update-env   # after editing ecosystem.config.js
 ```
 
-To stop auto-restarting on edits but keep everything else, set
-`Environment=WATCH_CODE=0` in `mc-dashboard-supervise.service`.
+That last one matters: `pm2 restart mc-dashboard-supervisor` does **not** re-read
+`ecosystem.config.js`, so env changes there are silently ignored unless you pass
+the file. To stop auto-restarting on edits but keep everything else, set
+`WATCH_CODE: "0"` in `ecosystem.config.js` and restart with the file.
+
+The hardware watchdog needs a reboot to arm. Confirm afterwards:
+
+```bash
+journalctl -b | grep -i watchdog     # "Watchdog running with a timeout of 14s"
+```
+
+`deploy/mc-dashboard.service` is a systemd alternative to all of the above, kept
+because it sandboxes the app in ways PM2 can't (`ProtectSystem=strict`,
+`ProtectHome`, `NoNewPrivileges`, `PrivateTmp`). **Don't run both** — they fight
+over port 8080.
 
 **Once you add the tunnel, it becomes the single point of failure** — the
 dashboard can be perfectly healthy and still unreachable if `cloudflared` dies.
-Give its unit the same `Restart=always` and `StartLimitIntervalSec=0`.
+Run it under PM2 too, or give its unit `Restart=always`.
 
 ## Exposing it publicly
 

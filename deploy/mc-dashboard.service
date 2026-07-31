@@ -1,3 +1,8 @@
+# ALTERNATIVE to running under PM2 — do not enable both, they fight over
+# port 8080. Kept because it sandboxes the dashboard in ways PM2 cannot
+# (ProtectSystem, ProtectHome, NoNewPrivileges, PrivateTmp below). If you are
+# using ecosystem.config.js, this unit should be disabled:
+#     sudo systemctl disable --now mc-dashboard
 [Unit]
 Description=Minecraft Dashboard
 After=network-online.target
