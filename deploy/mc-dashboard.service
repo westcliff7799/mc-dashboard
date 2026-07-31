@@ -1,0 +1,26 @@
+[Unit]
+Description=Minecraft Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=westcliff7799
+WorkingDirectory=/home/westcliff7799/mc-dashboard
+ExecStart=/home/westcliff7799/mc-dashboard/.venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 --port 8080 --proxy-headers --forwarded-allow-ips='127.0.0.1'
+Restart=always
+RestartSec=5
+
+# Binding to localhost only: the tunnel is the sole way in.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/westcliff7799/mc-dashboard
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Minecraft Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>Minecraft Dashboard</h1>
+    <span class="host" id="host">—</span>
+    <span class="spacer"></span>
+    <span class="host" id="link-state">connecting…</span>
+    <button class="action" id="logout">Sign out</button>
+  </header>
+
+  <main>
+    <div class="tabs" role="tablist">
+      <button role="tab" aria-selected="true"  data-tab="overview">Overview</button>
+      <button role="tab" aria-selected="false" data-tab="console">Console</button>
+      <button role="tab" aria-selected="false" data-tab="files">Files &amp; backups</button>
+    </div>
+
+    <!-- ---------------- Overview ---------------- -->
+    <section class="panel active" id="tab-overview">
+      <div class="card">
+        <div class="status-row">
+          <span class="pill unknown" id="status-pill">
+            <span id="status-icon" aria-hidden="true">•</span><span id="status-text">Checking…</span>
+          </span>
+          <span class="host" id="checked-at"></span>
+        </div>
+        <div class="motd" id="motd"></div>
+      </div>
+
+      <div class="tiles">
+        <div class="tile">
+          <div class="label">Players online</div>
+          <div class="value hero" id="t-players">—</div>
+          <div class="sub" id="t-players-sub"></div>
+        </div>
+        <div class="tile">
+          <div class="label">Version</div>
+          <div class="value text" id="t-version">—</div>
+        </div>
+        <div class="tile">
+          <div class="label">Latency</div>
+          <div class="value" id="t-latency">—</div>
+          <div class="sub">Pi → server</div>
+        </div>
+        <div class="tile">
+          <div class="label">Process</div>
+          <div class="value" id="t-process">—</div>
+          <div class="sub" id="t-process-sub"></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <h2>Who's online</h2>
+        <div class="players" id="players"><span class="empty">Nobody online.</span></div>
+      </div>
+
+      <div class="card">
+        <h2>Power</h2>
+        <div id="power-unavailable" class="notice" hidden>
+          <span aria-hidden="true">⚠</span>
+          <span><strong>Agent not connected.</strong> Start, stop and restart need
+          <code>mc-agent.py</code> running on the server machine.</span>
+        </div>
+        <div class="actions">
+          <button class="action" id="btn-start">Start</button>
+          <button class="action" id="btn-restart">Restart</button>
+          <button class="action danger" id="btn-stop">Stop</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------- Console ---------------- -->
+    <section class="panel" id="tab-console">
+      <div id="console-notice" class="notice" hidden></div>
+      <div class="card">
+        <h2>Server console</h2>
+        <div id="console" role="log" aria-live="polite"></div>
+        <form class="cmdbar" id="cmdform">
+          <input id="cmd" placeholder="/list" autocomplete="off" spellcheck="false"
+                 aria-label="Console command">
+          <button class="action primary" type="submit" id="cmd-send">Send</button>
+        </form>
+      </div>
+    </section>
+
+    <!-- ---------------- Files ---------------- -->
+    <section class="panel" id="tab-files">
+      <div id="files-notice" class="notice" hidden>
+        <span aria-hidden="true">⚠</span>
+        <span><strong>Agent not connected.</strong> File browsing and backups need
+        <code>mc-agent.py</code> running on the server machine.</span>
+      </div>
+
+      <div class="card">
+        <h2>Backups</h2>
+        <div class="actions">
+          <button class="action primary" id="btn-backup">Back up world now</button>
+        </div>
+        <table class="files" id="backup-table" style="margin-top:12px"></table>
+      </div>
+
+      <div class="card">
+        <h2>Server files</h2>
+        <div class="crumbs" id="crumbs"></div>
+        <table class="files" id="file-table"></table>
+        <pre class="viewer" id="viewer" hidden></pre>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

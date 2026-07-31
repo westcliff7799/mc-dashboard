@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Sign in — Minecraft Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="login-wrap">
+    <form class="login-card" id="form" method="post" action="/api/login">
+      <h1>Minecraft Dashboard</h1>
+      <p class="hint">Sign in to continue.</p>
+
+      <p class="error" id="error" role="alert"></p>
+
+      <label for="username">Username</label>
+      <input id="username" name="username" autocomplete="username" required autofocus>
+
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+
+      <button class="action primary" type="submit" id="submit">Sign in</button>
+    </form>
+  </div>
+
+  <script src="/static/login.js"></script>
+</body>
+</html>

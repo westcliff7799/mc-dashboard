@@ -1,0 +1,20 @@
+# Copy to agent.conf and edit.  chmod 600 agent.conf — it holds the token.
+
+dashboard_url = wss://mc.example.com/agent/ws
+token         = paste-the-AGENT_TOKEN-from-the-dashboard-here
+server_dir    = /home/minecraft/server
+
+# auto | systemd | docker | screen | managed
+# `auto` probes for a systemd unit, then a docker container, then a screen
+# session, and falls back to `managed` (the agent launches the jar itself).
+mode = auto
+
+service_name  = minecraft
+container     = minecraft
+screen_name   = minecraft
+
+# Required for mode=screen and mode=managed.
+start_command = java -Xmx4G -Xms4G -jar server.jar nogui
+
+backup_dir  = /home/minecraft/backups
+backup_keep = 7
