@@ -32,7 +32,7 @@ ROLE_GUEST = "guest"
 # so no combination of grants made here can produce a second owner.
 USERS_FILE = ROOT / "users.json"
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{2,32}$")
-MIN_PASSWORD_LENGTH = 12
+MIN_PASSWORD_LENGTH = 6
 
 MAX_ATTEMPTS = 8
 LOCKOUT_SECONDS = 900

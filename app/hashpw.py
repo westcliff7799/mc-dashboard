@@ -9,13 +9,13 @@ Read-only accounts aren't made here — add those from the dashboard's Debug tab
 import getpass
 import sys
 
-from .auth import hash_password
+from .auth import MIN_PASSWORD_LENGTH, hash_password
 
 
 def main() -> int:
     password = getpass.getpass("New dashboard password: ")
-    if len(password) < 12:
-        print("Refusing: use at least 12 characters — this login faces the internet.")
+    if len(password) < MIN_PASSWORD_LENGTH:
+        print(f"Refusing: use at least {MIN_PASSWORD_LENGTH} characters.")
         return 1
     if password != getpass.getpass("Confirm: "):
         print("Passwords did not match.")
