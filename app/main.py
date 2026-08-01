@@ -160,10 +160,22 @@ def agent_result(reply: dict[str, Any]) -> dict[str, Any]:
     The agent reports a rejected path or a full disk as `ok: false` with a
     message meant for a person, so it becomes a 400 the browser can show rather
     than a success the caller has to inspect.
+
+    One case is worth translating. The agent lives on someone else's machine and
+    is updated by hand, so it can be older than this dashboard — and an older one
+    answers a request it has never heard of with a bare "unknown action", which
+    reads like a bug here rather than a version skew. Naming the actual problem
+    saves whoever sees it from debugging the wrong end.
     """
     if not reply.get("ok", False):
-        detail = reply.get("error") or reply.get("detail") or "the agent could not do that"
-        raise HTTPException(400, str(detail))
+        detail = str(reply.get("error") or reply.get("detail") or "the agent could not do that")
+        if "unknown action" in detail:
+            raise HTTPException(
+                409,
+                "the agent on the server machine is running an older mc-agent.py that does not "
+                "support this — copy the current one over and restart it",
+            )
+        raise HTTPException(400, detail)
     return {key: value for key, value in reply.items() if key not in ("t", "id", "ok")}
 
 
