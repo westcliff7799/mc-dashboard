@@ -18,3 +18,11 @@ start_command = java -Xmx4G -Xms4G -jar server.jar nogui
 
 backup_dir  = /home/minecraft/backups
 backup_keep = 7
+
+# May the dashboard change files, or only read them?
+# Off by default. With `no`, editing, uploading, renaming, creating folders and
+# deleting are all refused by this agent no matter what the dashboard grants.
+allow_writes = no
+
+# Largest single upload accepted, in megabytes.
+max_upload_mb = 512

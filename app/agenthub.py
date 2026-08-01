@@ -95,6 +95,19 @@ class AgentHub:
             await self.broadcast({"t": "state", "state": self.state})
 
 
+    async def announce(self, line: str, kind: str = "echo") -> None:
+        """Record a dashboard-side action in the same log as the server's own.
+
+        Appended to the backlog, not just broadcast. Who uploaded, renamed or
+        deleted what is exactly the sort of thing someone goes looking for after
+        the fact, and a line that was only ever pushed live is gone for anyone
+        who wasn't watching that second — including the person who reloads the
+        page right after it happened.
+        """
+        entry = {"ts": time.time(), "line": line, "kind": kind}
+        self.logs.append(entry)
+        await self.broadcast({"t": "log", **entry}, permission=permissions.CONSOLE_VIEW)
+
     def add_browser(self, websocket: Any, username: str, role: str) -> None:
         self.browsers[websocket] = (username, role)
 

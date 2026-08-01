@@ -1,14 +1,28 @@
 """FastAPI application — the dashboard that runs on the Raspberry Pi."""
 
 import asyncio
+import base64
 import contextlib
 import json
+import posixpath
+import re
 import shutil
 import time
-from typing import Any
+import urllib.parse
+from typing import Any, AsyncIterator
 
-from fastapi import Depends, FastAPI, Form, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import agenthub, auth, permissions, ping, rcon
@@ -120,6 +134,39 @@ def require(*needed: str):
     return dependency
 
 
+async def audit(user: str, line: str) -> None:
+    """Put an operator action into the same console feed as everything else.
+
+    Every mutating request lands here, so the record of who uploaded, renamed or
+    deleted what sits inline with the server's own log and the commands people
+    ran — one timeline rather than three.
+    """
+    await hub.announce(f"[{user}] {line}")
+
+
+async def ask_agent(action: str, timeout: float = agenthub.REQUEST_TIMEOUT, **params: Any) -> dict:
+    """Round-trip to the agent, turning transport failures into HTTP errors."""
+    if not hub.connected:
+        raise HTTPException(409, "the agent is not connected — file access is unavailable")
+    try:
+        return await hub.request(action, timeout=timeout, **params)
+    except Exception as exc:
+        raise HTTPException(502, str(exc))
+
+
+def agent_result(reply: dict[str, Any]) -> dict[str, Any]:
+    """Unwrap a reply, raising whatever the agent refused with.
+
+    The agent reports a rejected path or a full disk as `ok: false` with a
+    message meant for a person, so it becomes a 400 the browser can show rather
+    than a success the caller has to inspect.
+    """
+    if not reply.get("ok", False):
+        detail = reply.get("error") or reply.get("detail") or "the agent could not do that"
+        raise HTTPException(400, str(detail))
+    return {key: value for key, value in reply.items() if key not in ("t", "id", "ok")}
+
+
 TRUSTED_PROXIES = {"127.0.0.1", "::1"}
 
 
@@ -149,6 +196,25 @@ def client_ip(request: Request) -> str:
         if hops := [hop.strip() for hop in forwarded.split(",") if hop.strip()]:
             return hops[-1]
     return peer
+
+
+@app.middleware("http")
+async def limit_request_body(request: Request, call_next):
+    """Reject an oversized upload before a byte of it is read.
+
+    Starlette parses the whole multipart body — spooling it to this machine's
+    disk — before the endpoint that would check its size ever runs, so the check
+    has to happen out here. A request without a Content-Length is let through
+    and counted as it streams instead.
+    """
+    if request.method == "POST" and request.url.path == "/api/files/upload":
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > settings.max_upload_bytes:
+            return JSONResponse(
+                {"detail": f"upload exceeds the {settings.max_upload_mb} MB limit"},
+                status_code=413,
+            )
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -273,15 +339,9 @@ async def api_command(payload: dict, user: str = Depends(require(permissions.CON
     except Exception as exc:
         raise HTTPException(502, f"RCON failed: {exc}")
 
-    await hub.broadcast(
-        {"t": "log", "ts": time.time(), "line": f"[{user}] > /{command}", "kind": "echo"},
-        permission=permissions.CONSOLE_VIEW,
-    )
+    await audit(user, f"> /{command}")
     if output:
-        await hub.broadcast(
-            {"t": "log", "ts": time.time(), "line": output, "kind": "reply"},
-            permission=permissions.CONSOLE_VIEW,
-        )
+        await hub.announce(output, kind="reply")
     return {"ok": True, "output": output}
 
 
@@ -302,10 +362,7 @@ async def api_power(payload: dict, request: Request):
         result = await hub.request("power", timeout=agenthub.POWER_TIMEOUT, value=action)
     except Exception as exc:
         raise HTTPException(502, str(exc))
-    await hub.broadcast(
-        {"t": "log", "ts": time.time(), "line": f"[{user}] requested {action}", "kind": "echo"},
-        permission=permissions.CONSOLE_VIEW,
-    )
+    await audit(user, f"requested {action}")
     return result
 
 
@@ -314,24 +371,222 @@ async def api_logs(_: str = Depends(require(permissions.CONSOLE_VIEW))):
     return {"lines": hub.recent_logs()}
 
 
+FILE_CHUNK_BYTES = 256 * 1024
+UPLOAD_TIMEOUT = 120.0
+
+UNSAFE_FILENAME = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def clean_relative(path: Any) -> str:
+    """Normalise a client-supplied path to a plain relative one.
+
+    The agent is the real boundary — every path it touches goes through
+    safe_path()/safe_leaf() against its own server_dir, which is the only place
+    that can actually decide what is inside the tree. This is the cheap check in
+    front of it, and it *rejects* `..` rather than collapsing it. Normalising
+    would be the tempting thing to do and is the wrong thing: `../../x.txt`
+    would quietly become `x.txt`, so a traversal attempt would land as a
+    successful write somewhere the caller never named. Refusing keeps a
+    surprising path surprising.
+
+    A leading slash is only ever a way of writing "from the server directory",
+    so that one is stripped rather than refused.
+    """
+    text = str(path or "").replace("\\", "/").strip()
+    if any(character in text for character in "\0\n\r"):
+        raise HTTPException(400, "invalid path")
+    if any(segment == ".." for segment in text.split("/")):
+        raise HTTPException(400, "paths cannot step outside the server directory")
+    normalised = posixpath.normpath("/" + text).lstrip("/")
+    return "" if normalised == "." else normalised
+
+
+def clean_name(name: Any) -> str:
+    """A single path component: no directories, no traversal, no separators."""
+    text = str(name or "").replace("\\", "/").strip().strip("/")
+    if not text or "/" in text or text in (".", "..") or "\0" in text:
+        raise HTTPException(400, "invalid name")
+    return text
+
+
+def join_relative(directory: str, name: str) -> str:
+    return f"{directory}/{name}" if directory else name
+
+
 @app.get("/api/files")
 async def api_files(path: str = "", _: str = Depends(require(permissions.FILES_BROWSE))):
-    if not hub.connected:
-        raise HTTPException(409, "the agent is not connected — file access is unavailable")
-    try:
-        return await hub.request("list_files", path=path)
-    except Exception as exc:
-        raise HTTPException(502, str(exc))
+    return agent_result(await ask_agent("list_files", path=clean_relative(path)))
 
 
 @app.get("/api/files/read")
 async def api_file_read(path: str, _: str = Depends(require(permissions.FILES_READ))):
-    if not hub.connected:
-        raise HTTPException(409, "the agent is not connected — file access is unavailable")
+    return agent_result(await ask_agent("read_file", path=clean_relative(path)))
+
+
+def disposition(name: str) -> str:
+    """A Content-Disposition value that a filename cannot break out of.
+
+    The name comes from the server's own filesystem, but it still ends up in a
+    response header, so it is spelled twice: an ASCII-only fallback with every
+    awkward character replaced, and an RFC 5987 form for anything Unicode. Both
+    are escaped, which is what keeps a file called `x";\\nSet-Cookie: …` from
+    becoming a second header.
+    """
+    ascii_name = UNSAFE_FILENAME.sub("_", name) or "download"
+    quoted = urllib.parse.quote(name, safe="")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quoted}"
+
+
+@app.get("/api/files/download")
+async def api_file_download(path: str, user: str = Depends(require(permissions.FILES_READ))):
+    """Stream a file of any size out through the agent socket.
+
+    Pulled chunk by chunk and yielded straight to the browser, so a 400 MB world
+    archive never has to be held whole in this process's memory — the Pi has
+    little enough of it, and several people may be downloading at once.
+    """
+    relative = clean_relative(path)
+    info = agent_result(await ask_agent("stat_file", path=relative))
+    size = int(info.get("size") or 0)
+
+    async def pull() -> AsyncIterator[bytes]:
+        offset = 0
+        while offset < size:
+            reply = agent_result(
+                await ask_agent(
+                    "read_chunk", path=relative, offset=offset, length=FILE_CHUNK_BYTES
+                )
+            )
+            blob = base64.b64decode(reply.get("data") or "")
+            if not blob:
+                break
+            offset += len(blob)
+            yield blob
+
+    await audit(user, f"downloaded {relative}")
+    return StreamingResponse(
+        pull(),
+        media_type="application/octet-stream",
+        headers={
+            "Content-Length": str(size),
+            "Content-Disposition": disposition(str(info.get("name") or "download")),
+        },
+    )
+
+
+@app.post("/api/files/write")
+async def api_file_write(payload: dict, user: str = Depends(require(permissions.FILES_WRITE))):
+    relative = clean_relative(payload.get("path"))
+    if not relative:
+        raise HTTPException(400, "a path is required")
+    result = agent_result(
+        await ask_agent(
+            "write_file",
+            path=relative,
+            content=str(payload.get("content") or ""),
+            overwrite=bool(payload.get("overwrite", True)),
+        )
+    )
+    await audit(user, f"saved {result.get('path', relative)} ({result.get('size', 0)} bytes)")
+    return result
+
+
+@app.post("/api/files/folder")
+async def api_file_mkdir(payload: dict, user: str = Depends(require(permissions.FILES_WRITE))):
+    target = join_relative(clean_relative(payload.get("path")), clean_name(payload.get("name")))
+    result = agent_result(await ask_agent("make_directory", path=target))
+    await audit(user, f"created folder {result.get('path', target)}")
+    return result
+
+
+@app.post("/api/files/rename")
+async def api_file_rename(payload: dict, user: str = Depends(require(permissions.FILES_WRITE))):
+    """Rename in place, or move by giving a `to` that contains a slash."""
+    source = clean_relative(payload.get("path"))
+    if not source:
+        raise HTTPException(400, "a path is required")
+
+    requested = str(payload.get("to") or "")
+    if "/" in requested.replace("\\", "/").strip("/"):
+        destination = clean_relative(requested)
+    else:
+        destination = join_relative(posixpath.dirname(source), clean_name(requested))
+    if not destination:
+        raise HTTPException(400, "a destination is required")
+
+    result = agent_result(await ask_agent("move_path", path=source, to=destination))
+    await audit(user, f"renamed {source} → {result.get('path', destination)}")
+    return result
+
+
+@app.post("/api/files/delete")
+async def api_file_delete(payload: dict, user: str = Depends(require(permissions.FILES_DELETE))):
+    raw = payload.get("paths")
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(400, "paths must be a non-empty list")
+    if len(raw) > 200:
+        raise HTTPException(400, "too many paths in one request")
+
+    targets = [clean_relative(item) for item in raw]
+    if not all(targets):
+        raise HTTPException(400, "the server directory itself cannot be deleted")
+
+    result = agent_result(await ask_agent("delete_paths", paths=targets, timeout=120.0))
+    if removed := result.get("removed"):
+        await audit(user, f"deleted {', '.join(removed)}")
+    return result
+
+
+@app.post("/api/files/upload")
+async def api_file_upload(
+    path: str = Form(""),
+    overwrite: bool = Form(False),
+    upload: UploadFile = File(...),
+    user: str = Depends(require(permissions.FILES_WRITE)),
+):
+    """Forward one uploaded file to the agent as a sequence of chunks.
+
+    The agent writes them to a temp file beside the destination and renames it
+    on commit, so a connection that drops halfway leaves nothing behind under
+    the real name. Anything that goes wrong after the upload has been opened
+    aborts it explicitly rather than waiting for the idle sweep.
+    """
+    name = clean_name(posixpath.basename(str(upload.filename or "").replace("\\", "/")))
+    target = join_relative(clean_relative(path), name)
+
+    declared = int(upload.size or 0)
+    if declared > settings.max_upload_bytes:
+        raise HTTPException(413, f"file is larger than the {settings.max_upload_mb} MB limit")
+
+    opened = agent_result(
+        await ask_agent("upload_begin", path=target, size=declared, overwrite=overwrite)
+    )
+    upload_id = opened.get("upload")
+
     try:
-        return await hub.request("read_file", path=path)
-    except Exception as exc:
-        raise HTTPException(502, str(exc))
+        sent = 0
+        while blob := await upload.read(FILE_CHUNK_BYTES):
+            sent += len(blob)
+            if sent > settings.max_upload_bytes:
+                raise HTTPException(413, f"file exceeds the {settings.max_upload_mb} MB limit")
+            agent_result(
+                await ask_agent(
+                    "upload_chunk",
+                    timeout=UPLOAD_TIMEOUT,
+                    upload=upload_id,
+                    data=base64.b64encode(blob).decode(),
+                )
+            )
+        result = agent_result(
+            await ask_agent("upload_commit", timeout=UPLOAD_TIMEOUT, upload=upload_id)
+        )
+    except Exception:
+        with contextlib.suppress(Exception):
+            await hub.request("upload_abort", upload=upload_id)
+        raise
+
+    await audit(user, f"uploaded {result.get('path', target)} ({result.get('size', 0)} bytes)")
+    return result
 
 
 @app.post("/api/backup")
@@ -342,10 +597,7 @@ async def api_backup(user: str = Depends(require(permissions.BACKUP_CREATE))):
         result = await hub.request("backup", timeout=agenthub.BACKUP_TIMEOUT)
     except Exception as exc:
         raise HTTPException(502, str(exc))
-    await hub.broadcast(
-        {"t": "log", "ts": time.time(), "line": f"[{user}] triggered a backup", "kind": "echo"},
-        permission=permissions.CONSOLE_VIEW,
-    )
+    await audit(user, "triggered a backup")
     return result
 
 

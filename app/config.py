@@ -58,6 +58,19 @@ class Settings:
 
     poll_seconds: int = field(default_factory=lambda: _int("POLL_SECONDS", 10))
 
+    max_upload_mb: int = field(default_factory=lambda: _int("MAX_UPLOAD_MB", 512))
+
+    @property
+    def max_upload_bytes(self) -> int:
+        """Ceiling on one upload, enforced before the body is read.
+
+        An upload is buffered here on the Pi before it is forwarded to the
+        agent, so an unbounded one would fill this machine's disk rather than
+        the server's. The agent applies its own limit as well; whichever is
+        lower wins.
+        """
+        return max(self.max_upload_mb, 1) * 1024 * 1024
+
     @property
     def rcon_enabled(self) -> bool:
         return bool(self.rcon_password)

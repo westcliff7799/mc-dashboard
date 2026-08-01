@@ -6,6 +6,10 @@ let capabilities = { rcon: false, agent: false, agent_configured: false };
 let socket = null;
 let backoff = 1000;
 let currentDir = '';
+let currentEntries = [];
+let openFilePath = null;
+let agentWritable = null;
+const selection = new Set();
 
 function toast(message, bad = false) {
   const el = $('toast');
@@ -101,9 +105,15 @@ function renderStatus(status) {
 
 function renderAgentState(state) {
   if (!state || !Object.keys(state).length) {
+    agentWritable = null;
     $('t-process').textContent = '—';
     $('t-process-sub').textContent = capabilities.agent ? '' : 'agent offline';
+    updateFileControls();
     return;
+  }
+  if (state.writable !== undefined) {
+    agentWritable = Boolean(state.writable);
+    updateFileControls();
   }
   $('t-process').textContent = state.running ? 'Running' : 'Stopped';
   const bits = [];
@@ -129,7 +139,8 @@ function applyCapabilities() {
   const agent = capabilities.agent;
 
   const seesConsole = can('console.view') || can('console.command');
-  const seesFiles = can('files.browse') || can('files.read') || can('backup.list') || can('backup.create');
+  const seesFiles = can('files.browse') || can('files.read') || can('files.write')
+    || can('files.delete') || can('backup.list') || can('backup.create');
   const seesDebug = can('debug.pm2') || capabilities.role === 'admin';
   setTabVisible('console', seesConsole);
   setTabVisible('files', seesFiles);
@@ -174,6 +185,15 @@ function applyCapabilities() {
 
   $('cmd').disabled = !capabilities.rcon || !can('console.command');
   $('cmd-send').disabled = !capabilities.rcon || !can('console.command');
+
+  $('btn-file-upload').hidden = !can('files.write');
+  $('btn-file-folder').hidden = !can('files.write');
+  $('btn-file-new').hidden = !can('files.write');
+  $('btn-file-rename').hidden = !can('files.write');
+  $('btn-file-delete').hidden = !can('files.delete');
+  $('btn-file-download').hidden = !can('files.read');
+  updateFileControls();
+
   if (!agent) renderAgentState(null);
 }
 
@@ -240,53 +260,181 @@ $('btn-start').addEventListener('click', () => power('start'));
 $('btn-stop').addEventListener('click', () => power('stop'));
 $('btn-restart').addEventListener('click', () => power('restart'));
 
+const JSON_HEADERS = { 'Content-Type': 'application/json' };
+
+function post(path, body) {
+  return api(path, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) });
+}
+
+function mayWriteFiles() {
+  return can('files.write') && capabilities.agent && agentWritable !== false;
+}
+
+function mayDeleteFiles() {
+  return can('files.delete') && capabilities.agent && agentWritable !== false;
+}
+
+function selectable() {
+  return can('files.write') || can('files.delete') || can('files.read');
+}
+
+function selectedEntries() {
+  return currentEntries.filter((entry) => selection.has(entry.path));
+}
+
 async function loadFiles(path) {
+  if (path !== currentDir) closeEditor();
   const table = $('file-table');
   try {
     const data = await api(`/api/files?path=${encodeURIComponent(path)}`);
     currentDir = data.path || '';
+    currentEntries = data.entries || [];
+    selection.clear();
     renderCrumbs(currentDir);
-    $('viewer').hidden = true;
-
-    table.innerHTML = '<tr><th>Name</th><th class="num">Size</th><th class="num">Modified</th></tr>';
-    if (currentDir) {
-      const up = currentDir.split('/').slice(0, -1).join('/');
-      table.appendChild(row('📁 ..', '', '', () => loadFiles(up)));
-    }
-    (data.entries || []).forEach((entry) => {
-      table.appendChild(row(
-        `${entry.dir ? '📁' : '📄'} ${entry.name}`,
-        entry.dir ? '' : bytes(entry.size),
-        new Date(entry.modified * 1000).toLocaleString(),
-        entry.dir ? () => loadFiles(entry.path) : () => viewFile(entry.path),
-      ));
-    });
+    $('disk-free').textContent = data.disk_free ? `${bytes(data.disk_free)} free` : '';
+    renderFileTable();
   } catch (error) {
-    table.innerHTML = '';
+    table.textContent = '';
+    currentEntries = [];
+    selection.clear();
+    updateFileControls();
     if (capabilities.agent) toast(error.message, true);
   }
 }
 
-function row(name, size, modified, onClick) {
+function syncSelectAll() {
+  const all = $('select-all');
+  if (all) all.checked = currentEntries.length > 0 && selection.size === currentEntries.length;
+}
+
+function fileHeader() {
   const tr = document.createElement('tr');
-  tr.className = 'clickable';
-  const nameCell = document.createElement('td');
-  nameCell.className = 'name';
-  nameCell.textContent = name;
-  const sizeCell = document.createElement('td');
-  sizeCell.className = 'num';
-  sizeCell.textContent = size;
-  const timeCell = document.createElement('td');
-  timeCell.className = 'num';
-  timeCell.textContent = modified;
-  tr.append(nameCell, sizeCell, timeCell);
-  tr.addEventListener('click', onClick);
+  if (selectable()) {
+    const cell = document.createElement('th');
+    cell.className = 'sel';
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.id = 'select-all';
+    box.setAttribute('aria-label', 'Select everything in this folder');
+    box.addEventListener('change', () => {
+      selection.clear();
+      if (box.checked) currentEntries.forEach((entry) => selection.add(entry.path));
+      renderFileTable();
+    });
+    cell.appendChild(box);
+    tr.appendChild(cell);
+  }
+  ['Name', 'Size', 'Modified'].forEach((label, index) => {
+    const cell = document.createElement('th');
+    cell.textContent = label;
+    if (index > 0) cell.className = 'num';
+    tr.appendChild(cell);
+  });
   return tr;
+}
+
+function fileRow(entry) {
+  const tr = document.createElement('tr');
+  tr.classList.toggle('selected', selection.has(entry.path));
+
+  if (selectable()) {
+    const cell = document.createElement('td');
+    cell.className = 'sel';
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = selection.has(entry.path);
+    box.setAttribute('aria-label', `Select ${entry.name}`);
+    box.addEventListener('change', () => {
+      if (box.checked) selection.add(entry.path);
+      else selection.delete(entry.path);
+      tr.classList.toggle('selected', box.checked);
+      syncSelectAll();
+      updateFileControls();
+    });
+    cell.appendChild(box);
+    tr.appendChild(cell);
+  }
+
+  const name = document.createElement('td');
+  name.className = 'name';
+  name.textContent = `${entry.dir ? '📁' : '📄'} ${entry.name}`;
+  if (entry.link) {
+    const marker = document.createElement('span');
+    marker.className = 'link';
+    marker.textContent = ' (link)';
+    name.appendChild(marker);
+  }
+  if (entry.dir || can('files.read')) {
+    name.classList.add('open');
+    name.addEventListener('click', () => (entry.dir ? loadFiles(entry.path) : openFile(entry.path)));
+  }
+
+  const size = document.createElement('td');
+  size.className = 'num';
+  size.textContent = entry.dir ? '' : bytes(entry.size);
+
+  const modified = document.createElement('td');
+  modified.className = 'num';
+  modified.textContent = new Date(entry.modified * 1000).toLocaleString();
+
+  tr.append(name, size, modified);
+  return tr;
+}
+
+function renderFileTable() {
+  const table = $('file-table');
+  const columns = selectable() ? 4 : 3;
+  table.textContent = '';
+  table.appendChild(fileHeader());
+
+  if (currentDir) {
+    const up = document.createElement('tr');
+    up.className = 'clickable';
+    const cell = document.createElement('td');
+    cell.className = 'name';
+    cell.colSpan = columns;
+    cell.textContent = '📁 ..';
+    up.appendChild(cell);
+    up.addEventListener('click', () => loadFiles(currentDir.split('/').slice(0, -1).join('/')));
+    table.appendChild(up);
+  }
+
+  if (!currentEntries.length) {
+    const empty = document.createElement('tr');
+    const cell = document.createElement('td');
+    cell.className = 'empty';
+    cell.colSpan = columns;
+    cell.textContent = 'This folder is empty.';
+    empty.appendChild(cell);
+    table.appendChild(empty);
+  }
+
+  currentEntries.forEach((entry) => table.appendChild(fileRow(entry)));
+  syncSelectAll();
+  updateFileControls();
+}
+
+function updateFileControls() {
+  const agent = capabilities.agent;
+  const write = mayWriteFiles();
+  const chosen = selectedEntries();
+  const single = chosen.length === 1 ? chosen[0] : null;
+
+  $('btn-file-refresh').disabled = !agent;
+  $('btn-file-upload').disabled = !write;
+  $('btn-file-folder').disabled = !write;
+  $('btn-file-new').disabled = !write;
+  $('btn-file-rename').disabled = !write || !single;
+  $('btn-file-delete').disabled = !mayDeleteFiles() || chosen.length === 0;
+  $('btn-file-download').disabled = !can('files.read') || !agent || !single || single.dir;
+
+  const blocked = can('files.write') || can('files.delete');
+  $('files-readonly').hidden = !(agent && agentWritable === false && blocked);
 }
 
 function renderCrumbs(path) {
   const crumbs = $('crumbs');
-  crumbs.innerHTML = '';
+  crumbs.textContent = '';
   const root = document.createElement('a');
   root.textContent = 'server';
   root.addEventListener('click', () => loadFiles(''));
@@ -304,17 +452,207 @@ function renderCrumbs(path) {
   });
 }
 
-async function viewFile(path) {
-  const viewer = $('viewer');
+function closeEditor() {
+  openFilePath = null;
+  $('editor').hidden = true;
+  $('editor-text').value = '';
+}
+
+async function openFile(path) {
   try {
     const data = await api(`/api/files/read?path=${encodeURIComponent(path)}`);
-    viewer.textContent = data.content;
-    viewer.hidden = false;
-    viewer.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    openFilePath = data.path || path;
+    const text = $('editor-text');
+    text.value = data.content;
+    text.readOnly = !mayWriteFiles();
+    $('editor-path').textContent = openFilePath;
+    $('editor-note').textContent = text.readOnly ? 'read-only' : bytes(data.size);
+    $('btn-editor-save').hidden = text.readOnly;
+    $('editor').hidden = false;
+    $('editor').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   } catch (error) {
     toast(error.message, true);
   }
 }
+
+async function saveFile() {
+  if (!openFilePath) return;
+  const button = $('btn-editor-save');
+  button.disabled = true;
+  try {
+    const result = await post('/api/files/write', {
+      path: openFilePath,
+      content: $('editor-text').value,
+    });
+    $('editor-note').textContent = bytes(result.size);
+    toast(`Saved ${result.path}`);
+    loadFiles(currentDir);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function newFolder() {
+  const name = (prompt('Name for the new folder') || '').trim();
+  if (!name) return;
+  try {
+    await post('/api/files/folder', { path: currentDir, name });
+    toast(`Created ${name}`);
+    loadFiles(currentDir);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function newFile() {
+  const name = (prompt('Name for the new file') || '').trim();
+  if (!name) return;
+  const target = currentDir ? `${currentDir}/${name}` : name;
+  try {
+    await post('/api/files/write', { path: target, content: '', overwrite: false });
+    await loadFiles(currentDir);
+    if (can('files.read')) openFile(target);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function renameSelected() {
+  const [entry] = selectedEntries();
+  if (!entry) return;
+  const next = (prompt(`Rename ${entry.name} to`, entry.name) || '').trim();
+  if (!next || next === entry.name) return;
+  try {
+    const result = await post('/api/files/rename', { path: entry.path, to: next });
+    toast(`Renamed to ${result.path}`);
+    if (openFilePath === entry.path) closeEditor();
+    loadFiles(currentDir);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function deleteSelected() {
+  const chosen = selectedEntries();
+  if (!chosen.length) return;
+  const label = chosen.length === 1 ? chosen[0].name : `${chosen.length} items`;
+  const folders = chosen.some((entry) => entry.dir);
+  const warning = folders ? '\n\nFolders go with everything inside them.' : '';
+  if (!confirm(`Delete ${label}?${warning}\n\nThis cannot be undone.`)) return;
+
+  try {
+    const result = await post('/api/files/delete', { paths: chosen.map((entry) => entry.path) });
+    const failed = result.failed || [];
+    if (failed.length) toast(`${failed[0].path}: ${failed[0].error}`, true);
+    else toast(`Deleted ${label}`);
+    if (chosen.some((entry) => entry.path === openFilePath)) closeEditor();
+    loadFiles(currentDir);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function downloadSelected() {
+  const [entry] = selectedEntries();
+  if (!entry || entry.dir) return;
+  const link = document.createElement('a');
+  link.href = `/api/files/download?path=${encodeURIComponent(entry.path)}`;
+  link.download = entry.name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+function uploadOne(file, overwrite) {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append('path', currentDir);
+    form.append('overwrite', overwrite ? 'true' : 'false');
+    form.append('upload', file, file.name);
+
+    const request = new XMLHttpRequest();
+    request.open('POST', '/api/files/upload');
+    request.upload.addEventListener('progress', (event) => {
+      if (event.lengthComputable) $('upload-bar').value = (event.loaded / event.total) * 100;
+    });
+    request.addEventListener('load', () => {
+      let data = {};
+      try { data = JSON.parse(request.responseText); } catch { }
+      if (request.status === 401) { window.location.href = '/login'; return; }
+      if (request.status >= 200 && request.status < 300) resolve(data);
+      else reject(new Error(data.detail || `HTTP ${request.status}`));
+    });
+    request.addEventListener('error', () => reject(new Error(`${file.name}: the upload failed`)));
+    request.addEventListener('abort', () => reject(new Error(`${file.name}: upload cancelled`)));
+    request.send(form);
+  });
+}
+
+async function uploadFiles(list) {
+  const files = Array.from(list || []);
+  if (!files.length || !mayWriteFiles()) return;
+
+  const here = new Set(currentEntries.filter((entry) => !entry.dir).map((entry) => entry.name));
+  const clashes = files.filter((file) => here.has(file.name)).map((file) => file.name);
+  if (clashes.length && !confirm(`Overwrite ${clashes.join(', ')}?`)) return;
+
+  $('upload-row').hidden = false;
+  try {
+    for (const [index, file] of files.entries()) {
+      $('upload-name').textContent = files.length > 1
+        ? `${file.name} — ${index + 1} of ${files.length}`
+        : file.name;
+      $('upload-bar').value = 0;
+      await uploadOne(file, here.has(file.name));
+    }
+    toast(files.length === 1 ? `Uploaded ${files[0].name}` : `Uploaded ${files.length} files`);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    $('upload-row').hidden = true;
+    $('file-input').value = '';
+    loadFiles(currentDir);
+  }
+}
+
+$('btn-file-refresh').addEventListener('click', () => loadFiles(currentDir));
+$('btn-file-upload').addEventListener('click', () => $('file-input').click());
+$('file-input').addEventListener('change', (event) => uploadFiles(event.target.files));
+$('btn-file-folder').addEventListener('click', newFolder);
+$('btn-file-new').addEventListener('click', newFile);
+$('btn-file-rename').addEventListener('click', renameSelected);
+$('btn-file-delete').addEventListener('click', deleteSelected);
+$('btn-file-download').addEventListener('click', downloadSelected);
+$('btn-editor-close').addEventListener('click', closeEditor);
+$('btn-editor-save').addEventListener('click', saveFile);
+
+$('editor-text').addEventListener('keydown', (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key === 's') {
+    event.preventDefault();
+    if (mayWriteFiles()) saveFile();
+  }
+});
+
+const dropzone = $('dropzone');
+
+dropzone.addEventListener('dragover', (event) => {
+  if (!mayWriteFiles()) return;
+  event.preventDefault();
+  dropzone.classList.add('over');
+});
+
+dropzone.addEventListener('dragleave', (event) => {
+  if (!dropzone.contains(event.relatedTarget)) dropzone.classList.remove('over');
+});
+
+dropzone.addEventListener('drop', (event) => {
+  dropzone.classList.remove('over');
+  if (!mayWriteFiles()) return;
+  event.preventDefault();
+  uploadFiles(event.dataTransfer.files);
+});
 
 async function loadBackups() {
   const table = $('backup-table');

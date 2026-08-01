@@ -251,9 +251,53 @@ button.action.primary { background: var(--accent); border-color: var(--accent); 
 }
 .cmdbar input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 
-.crumbs { font-family: var(--mono); font-size: 12px; color: var(--text-muted); margin-bottom: 10px; }
+.crumbs { font-family: var(--mono); font-size: 12px; color: var(--text-muted); }
 .crumbs a { color: var(--accent); text-decoration: none; cursor: pointer; }
 .crumbs a:hover { text-decoration: underline; }
+
+.filebar {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.filebar .disk { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--text-muted); }
+
+.actions .spacer { flex: 1; }
+.file-actions { margin-bottom: 12px; }
+
+.upload {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.upload .upload-name { font-family: var(--mono); overflow-wrap: anywhere; }
+.upload progress {
+  flex: 1;
+  min-width: 120px;
+  height: 6px;
+  accent-color: var(--accent);
+}
+
+.dropzone { position: relative; border-radius: 8px; }
+.dropzone .drop-hint {
+  position: absolute;
+  inset: 0;
+  display: none;
+  place-items: center;
+  pointer-events: none;
+  border: 2px dashed var(--accent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+}
+.dropzone.over .drop-hint { display: grid; }
 
 table.files { width: 100%; border-collapse: collapse; font-size: 13px; }
 table.files th {
@@ -269,22 +313,42 @@ table.files th {
 table.files td { padding: 7px 8px; border-bottom: 1px solid var(--hairline); }
 
 table.files td.num { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-secondary); }
+table.files td.sel { width: 1%; padding-right: 0; }
+table.files td.sel input { margin: 0; vertical-align: middle; }
+table.files th.sel { width: 1%; }
 table.files tr.clickable { cursor: pointer; }
 table.files tr.clickable:hover td { background: var(--page); }
+table.files tr.selected td { background: color-mix(in srgb, var(--accent) 10%, transparent); }
 table.files .name { font-family: var(--mono); }
+table.files .name.open { cursor: pointer; }
+table.files .name.open:hover { color: var(--accent); }
+table.files .link { color: var(--text-muted); font-style: italic; }
 
-.viewer {
+.editor { margin-top: 14px; border-top: 1px solid var(--hairline); padding-top: 12px; }
+.editor-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.editor-head .name { font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere; }
+.editor-head .spacer { flex: 1; }
+.editor-head .editor-note { font-size: 12px; color: var(--text-muted); }
+
+#editor-text {
+  width: 100%;
+  height: 420px;
+  resize: vertical;
   font-family: var(--mono);
   font-size: 12.5px;
+  line-height: 1.55;
   background: var(--page);
   border: 1px solid var(--hairline);
   border-radius: 8px;
   padding: 12px;
-  max-height: 420px;
-  overflow: auto;
+  color: var(--text-primary);
   white-space: pre;
-  margin-top: 12px;
+  overflow-wrap: normal;
+  overflow-x: auto;
+  tab-size: 2;
 }
+#editor-text:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+#editor-text[readonly] { color: var(--text-secondary); }
 
 .login-wrap { min-height: 100vh; display: grid; place-items: center; padding: 20px; }
 .login-card {

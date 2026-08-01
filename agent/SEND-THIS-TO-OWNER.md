@@ -24,20 +24,35 @@ program needs to run on your machine. That's what this is.
 | Start / stop / restart | Only the Minecraft server, via whichever mechanism you configure |
 | Stream the console | Reads `<server_dir>/logs/latest.log`. Read-only. |
 | List + read files | **Only inside `server_dir`.** Text files under 256 KB. |
+| Download files | **Only inside `server_dir`.** Any size. |
 | Back up worlds | Writes `tar.gz` archives into `backup_dir` |
-| Report status | Running/stopped, mode, PID, CPU/memory |
+| Report status | Running/stopped, mode, PID, CPU/memory, free disk |
 
 ## What it cannot do
 
 - Read anything outside `server_dir` — every path goes through `safe_path()`,
   which resolves symlinks and `..` and rejects anything landing outside.
-- Write or delete files. There is no write action. The only thing it ever
-  creates is backup archives.
 - Touch other services, other users, or the rest of your filesystem.
 - Run arbitrary commands. There is no such action.
+- **Change any file at all**, unless you opt in — see the next section.
 
 Please run it as the unprivileged user that owns the server directory, **not as
 root**.
+
+## Editing files is opt-in, and off by default
+
+The config ships with `allow_writes = no`. While it stays that way, the agent
+refuses every attempt to edit, upload, rename, create or delete — it can only
+look. On startup it prints which mode it's in, so you can check at a glance.
+
+If you'd rather I could also fix a config or drop in a plugin without bothering
+you, set `allow_writes = yes` and restart it. Even then everything stays inside
+`server_dir`, uploads are capped by `max_upload_mb`, and every change is logged
+with the name of the account that made it. Setting it back to `no` takes the
+ability away again, without you having to touch anything else.
+
+I'd suggest starting with `no` and only changing it if the read-only version
+turns out to be annoying in practice.
 
 ## Install
 

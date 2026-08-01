@@ -16,6 +16,8 @@ POWER_STOP = "power.stop"
 POWER_RESTART = "power.restart"
 FILES_BROWSE = "files.browse"
 FILES_READ = "files.read"
+FILES_WRITE = "files.write"
+FILES_DELETE = "files.delete"
 BACKUP_LIST = "backup.list"
 BACKUP_CREATE = "backup.create"
 DEBUG_PM2 = "debug.pm2"
@@ -69,8 +71,20 @@ GROUPS: list[dict[str, Any]] = [
             },
             {
                 "key": FILES_READ,
-                "label": "Read contents",
-                "detail": "Open files, which includes configs and anything secret in them.",
+                "label": "Read and download",
+                "detail": "Open or download any file, configs and their secrets included.",
+                "danger": True,
+            },
+            {
+                "key": FILES_WRITE,
+                "label": "Edit and upload",
+                "detail": "Save edits, upload files, make folders, rename and move things.",
+                "danger": True,
+            },
+            {
+                "key": FILES_DELETE,
+                "label": "Delete",
+                "detail": "Remove files and folders, worlds included. Nothing is recoverable.",
                 "danger": True,
             },
         ],

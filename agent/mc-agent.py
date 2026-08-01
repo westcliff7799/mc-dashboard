@@ -20,20 +20,25 @@ Config file (INI-style `key = value`, or use environment variables):
     start_command = java -Xmx4G -jar server.jar nogui   ; (mode=managed)
     backup_dir    = /home/minecraft/backups
     backup_keep   = 7
+    allow_writes  = no            ; opt in before the dashboard may change files
+    max_upload_mb = 512           ; largest single upload accepted
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import contextlib
 import json
 import os
 import pathlib
+import secrets
 import shutil
 import subprocess
 import tarfile
 import time
-from typing import TextIO
+from typing import Any, BinaryIO, TextIO
 
 try:
     import websockets
@@ -43,6 +48,13 @@ except ImportError:
 LOG_POLL_SECONDS = 0.5
 STATE_PUSH_SECONDS = 10
 MAX_READ_BYTES = 256 * 1024
+MAX_WRITE_BYTES = 1024 * 1024
+CHUNK_BYTES = 256 * 1024
+DEFAULT_MAX_UPLOAD_MB = 512
+UPLOAD_IDLE_SECONDS = 600
+UPLOAD_SUFFIX = ".dashboard-upload"
+WRITE_SUFFIX = ".dashboard-tmp"
+FREE_SPACE_MARGIN = 64 * 1024 * 1024
 
 
 
@@ -58,10 +70,36 @@ def load_config(path: str | None) -> dict[str, str]:
     for key in (
         "dashboard_url", "token", "server_dir", "mode", "service_name",
         "container", "screen_name", "start_command", "backup_dir", "backup_keep",
+        "allow_writes", "max_upload_mb",
     ):
         if env := os.environ.get(f"MCAGENT_{key.upper()}"):
             config[key] = env
     return config
+
+
+def truthy(value: str | None, default: bool) -> bool:
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in ("1", "yes", "y", "true", "on", "enabled")
+
+
+def writes_allowed(config: dict[str, str]) -> bool:
+    """Whether this machine's owner has opted in to file modification.
+
+    Off unless the config says otherwise, because earlier versions of this agent
+    could only read, and the README promised exactly that. Dropping in a newer
+    script should not quietly widen what the dashboard may do to someone's
+    files — that has to be a decision they make in their own config.
+    """
+    return truthy(config.get("allow_writes"), False)
+
+
+def upload_limit(config: dict[str, str]) -> int:
+    try:
+        megabytes = int(config.get("max_upload_mb") or DEFAULT_MAX_UPLOAD_MB)
+    except ValueError:
+        megabytes = DEFAULT_MAX_UPLOAD_MB
+    return max(megabytes, 1) * 1024 * 1024
 
 
 def run(args: list[str], timeout: int = 60) -> tuple[int, str]:
@@ -119,7 +157,15 @@ class Controller:
 
     def state(self) -> dict:
         running = self.is_running()
-        info: dict = {"mode": self.mode, "running": running, "server_dir": str(self.server_dir)}
+        info: dict = {
+            "mode": self.mode,
+            "running": running,
+            "server_dir": str(self.server_dir),
+            "writable": writes_allowed(self.config),
+        }
+        with contextlib.suppress(OSError):
+            usage = shutil.disk_usage(self.server_dir)
+            info["disk_free"], info["disk_total"] = usage.free, usage.total
         if running and self.mode == "docker":
             _, out = run(["docker", "stats", "--no-stream", "--format",
                           "{{.CPUPerc}}|{{.MemUsage}}", self.container])
@@ -249,6 +295,54 @@ def safe_path(server_dir: pathlib.Path, relative: str) -> pathlib.Path:
     return target
 
 
+def safe_leaf(server_dir: pathlib.Path, relative: str) -> pathlib.Path:
+    """Locate something by name without resolving the name itself.
+
+    Every operation that creates, replaces, moves or removes an entry needs a
+    path that may not exist yet, so safe_path()'s resolve() cannot vet it. The
+    parent goes through safe_path() as usual; the final component is only
+    joined on, never followed.
+
+    That difference matters twice. A symlink in the tree pointing outside it
+    stays deletable as a link — resolving first would make it un-deletable,
+    since the target it names is out of bounds. And a symlink cannot be used as
+    a back door for writes either: callers that put bytes anywhere check
+    is_symlink() and refuse, rather than following it out of the tree.
+    """
+    cleaned = relative.strip().strip("/")
+    if not cleaned:
+        raise PermissionError("a path is required")
+    parent_part, _, name = cleaned.rpartition("/")
+    if name in ("", ".", ".."):
+        raise PermissionError(f"invalid name: {name!r}")
+    parent = safe_path(server_dir, parent_part)
+    if not parent.is_dir():
+        raise NotADirectoryError(parent_part or "/")
+    return parent / name
+
+
+def relative_to_root(server_dir: pathlib.Path, target: pathlib.Path) -> str:
+    return str(target.relative_to(server_dir))
+
+
+def describe(server_dir: pathlib.Path, child: pathlib.Path) -> dict:
+    """One directory entry.
+
+    lstat(), not stat(), so a symlink is reported as itself: a broken one still
+    lists instead of vanishing, and the size shown is the link's rather than
+    that of whatever it points at.
+    """
+    stat = child.lstat()
+    return {
+        "name": child.name,
+        "path": relative_to_root(server_dir, child),
+        "dir": child.is_dir(),
+        "link": child.is_symlink(),
+        "size": stat.st_size,
+        "modified": stat.st_mtime,
+    }
+
+
 def list_files(server_dir: pathlib.Path, relative: str) -> dict:
     target = safe_path(server_dir, relative)
     if not target.is_dir():
@@ -256,27 +350,252 @@ def list_files(server_dir: pathlib.Path, relative: str) -> dict:
     entries = []
     for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
         try:
-            stat = child.stat()
+            entries.append(describe(server_dir, child))
         except OSError:
             continue
-        entries.append({
-            "name": child.name,
-            "path": str(child.relative_to(server_dir)),
-            "dir": child.is_dir(),
-            "size": stat.st_size,
-            "modified": stat.st_mtime,
-        })
-    return {"path": relative.strip("/"), "entries": entries}
+    listing: dict[str, Any] = {"path": relative.strip("/"), "entries": entries}
+    with contextlib.suppress(OSError):
+        usage = shutil.disk_usage(target)
+        listing["disk_free"], listing["disk_total"] = usage.free, usage.total
+    return listing
+
+
+def looks_binary(blob: bytes) -> bool:
+    return b"\0" in blob
 
 
 def read_file(server_dir: pathlib.Path, relative: str) -> dict:
+    """Read a text file for the editor.
+
+    Binary content is refused rather than mangled. errors="replace" would hand
+    back a jar as question marks, and saving that back through write_file()
+    would then overwrite the real bytes with the mangled ones — so anything with
+    a NUL in it is sent to the download path instead.
+    """
     target = safe_path(server_dir, relative)
     if not target.is_file():
         raise FileNotFoundError(relative)
     size = target.stat().st_size
     if size > MAX_READ_BYTES:
         raise ValueError(f"file is {size} bytes; only text files under 256 KB can be viewed")
-    return {"path": relative, "content": target.read_text(errors="replace"), "size": size}
+    blob = target.read_bytes()
+    if looks_binary(blob[:8192]):
+        raise ValueError("this is a binary file — download it instead of opening it")
+    return {"path": relative, "content": blob.decode(errors="replace"), "size": size}
+
+
+def stat_file(server_dir: pathlib.Path, relative: str) -> dict:
+    target = safe_path(server_dir, relative)
+    if not target.is_file():
+        raise FileNotFoundError(relative)
+    stat = target.stat()
+    return {"path": relative, "name": target.name, "size": stat.st_size, "modified": stat.st_mtime}
+
+
+def read_chunk(server_dir: pathlib.Path, relative: str, offset: Any, length: Any) -> dict:
+    """One slice of a file, base64'd, for the download stream.
+
+    Downloads are pulled a chunk at a time rather than in one message so that a
+    600 MB world archive doesn't have to fit in a single WebSocket frame — or in
+    the memory of either end.
+    """
+    target = safe_path(server_dir, relative)
+    if not target.is_file():
+        raise FileNotFoundError(relative)
+    span = min(max(int(length or 0), 0), CHUNK_BYTES)
+    with target.open("rb") as handle:
+        handle.seek(max(int(offset or 0), 0))
+        blob = handle.read(span)
+    return {"offset": int(offset or 0), "bytes": len(blob), "data": base64.b64encode(blob).decode()}
+
+
+def replace_atomically(target: pathlib.Path, temporary: pathlib.Path) -> None:
+    """Move `temporary` onto `target`, keeping the mode `target` already had.
+
+    A rename is atomic, so a reader — the Minecraft server itself, most of the
+    time — sees either the old file or the new one, never a half-written one.
+    The mode is carried across because the temp file is created with the default
+    0644: without this, saving server.properties would quietly widen it.
+    """
+    if target.exists():
+        shutil.copymode(target, temporary)
+    os.replace(temporary, target)
+
+
+def write_file(server_dir: pathlib.Path, relative: str, content: str, overwrite: bool) -> dict:
+    target = safe_leaf(server_dir, relative)
+    if target.is_symlink():
+        raise PermissionError("refusing to write through a symlink")
+    if target.is_dir():
+        raise IsADirectoryError(relative)
+    if target.exists() and not overwrite:
+        raise FileExistsError(f"{relative} already exists")
+    blob = content.encode()
+    if len(blob) > MAX_WRITE_BYTES:
+        raise ValueError(f"content is {len(blob)} bytes; the editor tops out at {MAX_WRITE_BYTES}")
+
+    temporary = target.with_name(f".{target.name}{WRITE_SUFFIX}")
+    temporary.write_bytes(blob)
+    try:
+        replace_atomically(target, temporary)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        raise
+    return {"path": relative_to_root(server_dir, target), "size": len(blob)}
+
+
+def make_directory(server_dir: pathlib.Path, relative: str) -> dict:
+    target = safe_leaf(server_dir, relative)
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(f"{relative} already exists")
+    target.mkdir(parents=True)
+    return {"path": relative_to_root(server_dir, target)}
+
+
+def move_path(server_dir: pathlib.Path, relative: str, destination: str) -> dict:
+    """Rename or move one entry, both ends confined to the tree.
+
+    Refuses an existing destination outright. shutil.move() would otherwise
+    treat a directory destination as "move inside it", which turns a mistyped
+    rename into a silent reorganisation.
+    """
+    source = safe_leaf(server_dir, relative)
+    if not source.exists() and not source.is_symlink():
+        raise FileNotFoundError(relative)
+    target = safe_leaf(server_dir, destination)
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(f"{destination} already exists")
+    if target == source:
+        return {"path": relative_to_root(server_dir, target), "from": relative}
+    shutil.move(str(source), str(target))
+    return {"path": relative_to_root(server_dir, target), "from": relative}
+
+
+def delete_paths(server_dir: pathlib.Path, relatives: Any) -> dict:
+    """Remove each path, reporting per-entry outcomes rather than stopping.
+
+    A multi-select delete where the third of five fails should still tell the
+    operator which four went, so each entry is caught on its own. safe_leaf()
+    rejects an empty path, which is what keeps server_dir itself from being the
+    thing that gets removed.
+    """
+    removed: list[str] = []
+    failed: list[dict] = []
+    for relative in relatives if isinstance(relatives, (list, tuple)) else []:
+        try:
+            target = safe_leaf(server_dir, str(relative))
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif target.is_dir():
+                shutil.rmtree(target)
+            else:
+                raise FileNotFoundError(relative)
+            removed.append(str(relative))
+        except Exception as exc:
+            failed.append({"path": str(relative), "error": f"{type(exc).__name__}: {exc}"})
+    return {"removed": removed, "failed": failed}
+
+
+class UploadStore:
+    """Uploads in flight, each streaming into a temp file beside its target.
+
+    The bytes land next to the final path rather than in /tmp for two reasons:
+    the commit is then a rename on the same filesystem, so it is atomic and
+    cheap even for a 500 MB archive, and a partial upload never appears under
+    the real name where the server might try to load it.
+
+    An upload the dashboard never finishes — browser closed, tunnel dropped —
+    would otherwise leave its temp file and an open handle behind forever, so
+    anything idle past UPLOAD_IDLE_SECONDS is swept when the next one starts.
+    """
+
+    def __init__(self, limit_bytes: int) -> None:
+        self.limit = limit_bytes
+        self.sessions: dict[str, dict[str, Any]] = {}
+
+    def begin(self, server_dir: pathlib.Path, relative: str, declared: Any, overwrite: bool) -> dict:
+        self.sweep()
+        target = safe_leaf(server_dir, relative)
+        if target.is_symlink():
+            raise PermissionError("refusing to write through a symlink")
+        if target.is_dir():
+            raise IsADirectoryError(relative)
+        if target.exists() and not overwrite:
+            raise FileExistsError(f"{target.name} already exists here")
+
+        size = max(int(declared or 0), 0)
+        if size > self.limit:
+            raise ValueError(f"upload is {size} bytes; this agent accepts at most {self.limit}")
+        free = shutil.disk_usage(target.parent).free
+        if size and size + FREE_SPACE_MARGIN > free:
+            raise OSError(f"not enough room: {free} bytes free, {size} needed")
+
+        upload_id = secrets.token_hex(8)
+        temporary = target.with_name(f".{target.name}.{upload_id}{UPLOAD_SUFFIX}")
+        handle: BinaryIO = temporary.open("wb")
+        self.sessions[upload_id] = {
+            "handle": handle,
+            "temporary": temporary,
+            "target": target,
+            "path": relative_to_root(server_dir, target),
+            "written": 0,
+            "touched": time.time(),
+        }
+        return {"upload": upload_id, "path": relative_to_root(server_dir, target)}
+
+    def _session(self, upload_id: Any) -> dict[str, Any]:
+        session = self.sessions.get(str(upload_id))
+        if session is None:
+            raise KeyError(f"unknown or expired upload: {upload_id}")
+        session["touched"] = time.time()
+        return session
+
+    def chunk(self, upload_id: Any, data: Any) -> dict:
+        session = self._session(upload_id)
+        blob = base64.b64decode(data or "")
+        if session["written"] + len(blob) > self.limit:
+            self.abort(upload_id)
+            raise ValueError(f"upload exceeds the {self.limit} byte limit")
+        session["handle"].write(blob)
+        session["written"] += len(blob)
+        return {"received": session["written"]}
+
+    def commit(self, upload_id: Any) -> dict:
+        session = self._session(upload_id)
+        handle = session["handle"]
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        try:
+            replace_atomically(session["target"], session["temporary"])
+        except OSError:
+            session["temporary"].unlink(missing_ok=True)
+            raise
+        finally:
+            self.sessions.pop(str(upload_id), None)
+        return {"path": session["path"], "size": session["written"]}
+
+    def abort(self, upload_id: Any) -> dict:
+        session = self.sessions.pop(str(upload_id), None)
+        if session is None:
+            return {"aborted": False}
+        with contextlib.suppress(Exception):
+            session["handle"].close()
+        with contextlib.suppress(OSError):
+            session["temporary"].unlink(missing_ok=True)
+        return {"aborted": True, "path": session["path"]}
+
+    def sweep(self) -> None:
+        now = time.time()
+        for upload_id in [
+            key for key, session in self.sessions.items()
+            if now - session["touched"] > UPLOAD_IDLE_SECONDS
+        ]:
+            self.abort(upload_id)
+
+    def abort_all(self) -> None:
+        for upload_id in list(self.sessions):
+            self.abort(upload_id)
 
 
 def make_backup(config: dict, server_dir: pathlib.Path) -> dict:
@@ -322,10 +641,26 @@ def list_backups(config: dict, server_dir: pathlib.Path) -> dict:
 
 
 
-async def handle_command(message: dict, controller: Controller, config: dict) -> dict:
+MUTATING_ACTIONS = frozenset({
+    "write_file", "make_directory", "move_path", "delete_paths",
+    "upload_begin", "upload_chunk", "upload_commit", "upload_abort",
+})
+
+
+async def handle_command(
+    message: dict, controller: Controller, config: dict, uploads: UploadStore
+) -> dict:
     action = message.get("action")
     server_dir = controller.server_dir
     loop = asyncio.get_running_loop()
+
+    if action in MUTATING_ACTIONS and not writes_allowed(config):
+        return {
+            "t": "result",
+            "id": message.get("id"),
+            "ok": False,
+            "error": "this agent is read-only — set `allow_writes = yes` in agent.conf to change files",
+        }
 
     def blocking() -> dict:
         if action == "power":
@@ -343,6 +678,40 @@ async def handle_command(message: dict, controller: Controller, config: dict) ->
             return {"ok": True, **list_files(server_dir, message.get("path", ""))}
         if action == "read_file":
             return {"ok": True, **read_file(server_dir, message.get("path", ""))}
+        if action == "stat_file":
+            return {"ok": True, **stat_file(server_dir, message.get("path", ""))}
+        if action == "read_chunk":
+            return {"ok": True, **read_chunk(
+                server_dir, message.get("path", ""), message.get("offset"), message.get("length")
+            )}
+        if action == "write_file":
+            return {"ok": True, **write_file(
+                server_dir,
+                message.get("path", ""),
+                str(message.get("content") or ""),
+                bool(message.get("overwrite", True)),
+            )}
+        if action == "make_directory":
+            return {"ok": True, **make_directory(server_dir, message.get("path", ""))}
+        if action == "move_path":
+            return {"ok": True, **move_path(
+                server_dir, message.get("path", ""), message.get("to", "")
+            )}
+        if action == "delete_paths":
+            return {"ok": True, **delete_paths(server_dir, message.get("paths"))}
+        if action == "upload_begin":
+            return {"ok": True, **uploads.begin(
+                server_dir,
+                message.get("path", ""),
+                message.get("size"),
+                bool(message.get("overwrite", False)),
+            )}
+        if action == "upload_chunk":
+            return {"ok": True, **uploads.chunk(message.get("upload"), message.get("data"))}
+        if action == "upload_commit":
+            return {"ok": True, **uploads.commit(message.get("upload"))}
+        if action == "upload_abort":
+            return {"ok": True, **uploads.abort(message.get("upload"))}
         if action == "backup":
             return {"ok": True, **make_backup(config, server_dir)}
         if action == "list_backups":
@@ -358,7 +727,7 @@ async def handle_command(message: dict, controller: Controller, config: dict) ->
     return {"t": "result", "id": message.get("id"), **result}
 
 
-async def session(url: str, controller: Controller, config: dict) -> None:
+async def session(url: str, controller: Controller, config: dict, uploads: UploadStore) -> None:
     async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=2**22) as ws:
         print(f"[agent] connected ({controller.mode} mode)", flush=True)
         tail = LogTail(controller.server_dir)
@@ -379,13 +748,16 @@ async def session(url: str, controller: Controller, config: dict) -> None:
             async for raw in ws:
                 message = json.loads(raw)
                 if message.get("t") == "cmd":
-                    reply = await handle_command(message, controller, config)
+                    reply = await handle_command(message, controller, config, uploads)
                     await ws.send(json.dumps(reply))
 
-        done, pending = await asyncio.wait(
-            [asyncio.create_task(pump_logs()), asyncio.create_task(pump_commands())],
-            return_when=asyncio.FIRST_EXCEPTION,
-        )
+        try:
+            done, pending = await asyncio.wait(
+                [asyncio.create_task(pump_logs()), asyncio.create_task(pump_commands())],
+                return_when=asyncio.FIRST_EXCEPTION,
+            )
+        finally:
+            uploads.abort_all()
         for task in pending:
             task.cancel()
         for task in done:
@@ -403,7 +775,15 @@ async def main() -> None:
             raise SystemExit(f"config error: '{required}' is required")
 
     controller = Controller(config)
+    uploads = UploadStore(upload_limit(config))
     print(f"[agent] server_dir={controller.server_dir} mode={controller.mode}", flush=True)
+    print(
+        "[agent] files: read/write, uploads up to "
+        f"{uploads.limit // (1024 * 1024)} MB"
+        if writes_allowed(config)
+        else "[agent] files: read-only (set `allow_writes = yes` in agent.conf to allow changes)",
+        flush=True,
+    )
 
     separator = "&" if "?" in config["dashboard_url"] else "?"
     url = f"{config['dashboard_url']}{separator}token={config['token']}"
@@ -411,7 +791,7 @@ async def main() -> None:
     backoff = 1
     while True:
         try:
-            await session(url, controller, config)
+            await session(url, controller, config, uploads)
             backoff = 1
         except Exception as exc:
             print(f"[agent] disconnected: {type(exc).__name__}: {exc}", flush=True)

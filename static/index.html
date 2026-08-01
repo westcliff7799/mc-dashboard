@@ -107,9 +107,53 @@
 
       <div class="card">
         <h2>Server files</h2>
-        <div class="crumbs" id="crumbs"></div>
-        <table class="files" id="file-table"></table>
-        <pre class="viewer" id="viewer" hidden></pre>
+
+        <div id="files-readonly" class="notice" hidden>
+          <span aria-hidden="true">⚠</span>
+          <span><strong>The agent is read-only.</strong> Whoever runs
+          <code>mc-agent.py</code> has to set <code>allow_writes = yes</code> in
+          <code>agent.conf</code> before anything here can be changed.</span>
+        </div>
+
+        <div class="filebar">
+          <div class="crumbs" id="crumbs"></div>
+          <span class="disk" id="disk-free"></span>
+        </div>
+
+        <div class="actions file-actions">
+          <button class="action" id="btn-file-refresh">Refresh</button>
+          <button class="action" id="btn-file-upload">Upload…</button>
+          <button class="action" id="btn-file-folder">New folder</button>
+          <button class="action" id="btn-file-new">New file</button>
+          <span class="spacer"></span>
+          <button class="action" id="btn-file-download">Download</button>
+          <button class="action" id="btn-file-rename">Rename</button>
+          <button class="action danger" id="btn-file-delete">Delete</button>
+        </div>
+
+        <input type="file" id="file-input" multiple hidden>
+
+        <div class="upload" id="upload-row" hidden>
+          <span class="upload-name" id="upload-name"></span>
+          <progress id="upload-bar" max="100" value="0"></progress>
+        </div>
+
+        <div class="dropzone" id="dropzone">
+          <table class="files" id="file-table"></table>
+          <div class="drop-hint" id="drop-hint" aria-hidden="true">Drop to upload here</div>
+        </div>
+
+        <div class="editor" id="editor" hidden>
+          <div class="editor-head">
+            <span class="name" id="editor-path"></span>
+            <span class="spacer"></span>
+            <span class="editor-note" id="editor-note"></span>
+            <button class="action" id="btn-editor-close">Close</button>
+            <button class="action primary" id="btn-editor-save">Save</button>
+          </div>
+          <textarea id="editor-text" spellcheck="false" autocomplete="off"
+                    aria-label="File contents"></textarea>
+        </div>
       </div>
     </section>
 

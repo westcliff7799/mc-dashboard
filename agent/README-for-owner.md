@@ -19,8 +19,35 @@ static IP. The connection is made from your machine, outward, like a browser.
 | Start / stop / restart | Only the Minecraft server, via the exact mechanism you configure (`systemctl`, `docker`, `screen`, or a jar it launches itself) |
 | Stream the console | Reads `<server_dir>/logs/latest.log`. Read-only. |
 | List and read files | **Only inside `server_dir`.** Text files under 256 KB. |
+| Download files | **Only inside `server_dir`.** Any size, streamed in chunks. |
 | Create world backups | `tar.gz` of world folders into `backup_dir` |
-| Report status | Running/stopped, mode, PID, CPU/memory |
+| Report status | Running/stopped, mode, PID, CPU/memory, free disk |
+| Change files — **only if you turn it on** | See below |
+
+## Changing files is off until you say otherwise
+
+Out of the box this agent **cannot write anything**. Editing, uploading,
+renaming, creating folders and deleting are all refused until you put
+
+```ini
+allow_writes = yes
+```
+
+in your `agent.conf`. It is off by default on purpose: earlier versions of this
+agent could only read, and dropping in a newer copy shouldn't quietly widen what
+someone else can do to your files. The agent prints which mode it is in on
+startup, so you can always check:
+
+```
+[agent] files: read-only (set `allow_writes = yes` in agent.conf to allow changes)
+```
+
+With it on, the dashboard can edit, upload (up to `max_upload_mb`, default 512),
+rename, move, create folders and delete — all still confined to `server_dir`.
+Whoever runs the dashboard also has to grant each account those permissions
+separately, and every change is written to the console log with the name of the
+account that made it. Turning the flag back off and restarting the agent revokes
+all of it instantly, without touching the dashboard.
 
 ## What it cannot do
 
@@ -29,11 +56,14 @@ static IP. The connection is made from your machine, outward, like a browser.
 - It cannot read outside `server_dir`. Every path goes through `safe_path()`,
   which resolves symlinks and `..` and rejects anything landing outside that
   directory.
-- It cannot write or delete files. There is no write action at all. The only
-  thing it creates is backup archives in `backup_dir`.
+- It cannot write outside `server_dir` either, even with `allow_writes = yes`.
+  Paths that create or remove something go through `safe_leaf()`, which vets the
+  parent the same way and refuses to follow a symlink out of the tree.
 - It cannot touch other services, other users, or the rest of your filesystem.
 
 Run it as an unprivileged user that owns the server directory — not as root.
+That is what stops a mistake in the panel from reaching anything but the server
+files, and it matters more once `allow_writes` is on.
 
 ### Prefer systemd, docker or screen over `managed`
 
@@ -103,6 +133,9 @@ narrow sudoers line scoped to `systemctl start/stop minecraft` only.
 `systemctl --user stop mc-agent`, or rotate `AGENT_TOKEN` on the dashboard side.
 Either kills all Tier 2 access instantly. The dashboard keeps working in
 read-only mode; nothing else breaks.
+
+To keep the agent but take away only file changes, set `allow_writes = no` and
+restart it. Browsing, the console feed and backups carry on as before.
 
 ## The lighter option
 
