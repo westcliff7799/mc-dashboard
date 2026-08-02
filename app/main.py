@@ -31,18 +31,91 @@ from .config import ROOT, settings
 
 STATIC = ROOT / "static"
 
-status_cache: dict[str, Any] = {"online": False, "error": "not polled yet", "checked_at": None}
+status_cache: dict[str, Any] = {
+    "online": False,
+    "state": "unknown",
+    "error": "not polled yet",
+    "checked_at": None,
+}
+
+_last_target: tuple[str, int, str] | None = None
+
+
+def parse_address(raw: Any) -> tuple[str, int] | None:
+    """Split a reported "host:port" pair, or None if it is not one."""
+    if not isinstance(raw, str) or ":" not in raw:
+        return None
+    host, _, port_raw = raw.rpartition(":")
+    host = host.strip().strip("[]")
+    if not host or any(char.isspace() or char in "/@" for char in host):
+        return None
+    try:
+        port = int(port_raw)
+    except ValueError:
+        return None
+    return (host, port) if 0 < port <= 65535 else None
+
+
+def resolve_target(kind: str) -> tuple[str, int, str]:
+    """Where to reach the server, preferring the address the agent reports.
+
+    A tunnel in front of someone else's machine hands out a fresh host:port
+    every time it restarts, which strands a hardcoded MC_HOST silently — from
+    out here a dead address is indistinguishable from a stopped server. The
+    agent sits on that machine and can read the address it was actually given,
+    so when it offers one that wins over the .env fallback.
+    """
+    fallback = {
+        "mc": (settings.mc_host, settings.mc_port),
+        "rcon": (settings.effective_rcon_host, settings.rcon_port),
+    }[kind]
+    if settings.trust_agent_address and hub.connected:
+        parsed = parse_address((hub.state.get("endpoints") or {}).get(kind))
+        if parsed is not None:
+            return parsed[0], parsed[1], "agent"
+    return fallback[0], fallback[1], "config"
+
+
+def derive_state(online: bool) -> str:
+    """Reconcile the ping against what the agent says about the process.
+
+    A failed ping on its own does not mean the server is down, and calling it
+    "Offline" sends you to the wrong machine. When the agent is attached it
+    knows which of the two it is, so say so.
+    """
+    if online:
+        return "online"
+    if not hub.connected:
+        return "offline"
+    running = hub.state.get("running")
+    if running is True:
+        return "unreachable"
+    if running is False:
+        return "stopped"
+    return "offline"
 
 
 async def poll_once() -> dict[str, Any]:
-    result = await ping.ping(settings.mc_host, settings.mc_port)
+    global _last_target
+
+    host, port, source = resolve_target("mc")
+    result = await ping.ping(host, port)
     result["checked_at"] = time.time()
+    result["address_source"] = source
+
+    target = (host, port, source)
+    if _last_target is not None and _last_target != target:
+        await hub.announce(
+            f"server address is now {host}:{port} (reported by {source})", kind="echo"
+        )
+    _last_target = target
 
     if result["online"] and settings.rcon_enabled:
+        rcon_host, rcon_port, _ = resolve_target("rcon")
         try:
             output = await rcon.execute(
-                settings.effective_rcon_host,
-                settings.rcon_port,
+                rcon_host,
+                rcon_port,
                 settings.rcon_password,
                 "list",
             )
@@ -64,6 +137,7 @@ async def poll_once() -> dict[str, Any]:
         "agent": hub.connected,
     }
     result["agent_state"] = hub.state
+    result["state"] = derive_state(bool(result["online"]))
     return result
 
 
@@ -74,7 +148,12 @@ async def poller() -> None:
             status_cache = await poll_once()
             await hub.broadcast({"t": "status", "status": status_cache})
         except Exception as exc:
-            status_cache = {"online": False, "error": str(exc), "checked_at": time.time()}
+            status_cache = {
+                "online": False,
+                "state": derive_state(False),
+                "error": str(exc),
+                "checked_at": time.time(),
+            }
         await asyncio.sleep(settings.poll_seconds)
 
 

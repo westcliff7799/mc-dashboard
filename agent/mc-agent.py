@@ -22,6 +22,11 @@ Config file (INI-style `key = value`, or use environment variables):
     backup_keep   = 7
     allow_writes  = no            ; opt in before the dashboard may change files
     max_upload_mb = 512           ; largest single upload accepted
+    tunnel_api    = http://127.0.0.1:4040/api/tunnels   ; ngrok's local API
+    server_port   = 25565         ; local port the tunnel forwards to
+    rcon_port     = 25575
+    public_mc     = 2.tcp.ngrok.io:11591   ; skip discovery, state it outright
+    public_rcon   = 4.tcp.ngrok.io:17554
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ import shutil
 import subprocess
 import tarfile
 import time
+import urllib.request
 from typing import Any, BinaryIO, TextIO
 
 try:
@@ -55,6 +61,10 @@ UPLOAD_IDLE_SECONDS = 600
 UPLOAD_SUFFIX = ".dashboard-upload"
 WRITE_SUFFIX = ".dashboard-tmp"
 FREE_SPACE_MARGIN = 64 * 1024 * 1024
+TUNNEL_API_DEFAULT = "http://127.0.0.1:4040/api/tunnels"
+TUNNEL_CACHE_SECONDS = 60
+TUNNEL_TIMEOUT = 2.0
+TUNNEL_MAX_BYTES = 256 * 1024
 
 
 
@@ -70,7 +80,8 @@ def load_config(path: str | None) -> dict[str, str]:
     for key in (
         "dashboard_url", "token", "server_dir", "mode", "service_name",
         "container", "screen_name", "start_command", "backup_dir", "backup_keep",
-        "allow_writes", "max_upload_mb",
+        "allow_writes", "max_upload_mb", "tunnel_api", "server_port", "rcon_port",
+        "public_mc", "public_rcon",
     ):
         if env := os.environ.get(f"MCAGENT_{key.upper()}"):
             config[key] = env
@@ -102,6 +113,75 @@ def upload_limit(config: dict[str, str]) -> int:
     return max(megabytes, 1) * 1024 * 1024
 
 
+def port_or(raw: str | None, default: int) -> int:
+    try:
+        return int(str(raw).strip())
+    except (AttributeError, TypeError, ValueError):
+        return default
+
+
+class EndpointProbe:
+    """The public address this machine is currently reachable on.
+
+    A tunnel hands out a fresh host:port every time it restarts. The dashboard
+    cannot see that happen from the outside — a reassigned address and a
+    stopped server both just stop answering — but the tunnel's own local API
+    can, and it is on this side of the connection. Reporting the address
+    upward is what keeps the dashboard pointed at the right place without
+    anyone hand-editing a config after every restart.
+
+    Best effort throughout: no tunnel, no API, or an API that answers with
+    something unexpected simply means no address is reported and the dashboard
+    falls back to what its own config says.
+    """
+
+    def __init__(self, config: dict[str, str]) -> None:
+        self.api = config.get("tunnel_api", TUNNEL_API_DEFAULT).strip()
+        self.manual = {
+            "mc": (config.get("public_mc") or "").strip(),
+            "rcon": (config.get("public_rcon") or "").strip(),
+        }
+        self.local_ports = {
+            "mc": port_or(config.get("server_port"), 25565),
+            "rcon": port_or(config.get("rcon_port"), 25575),
+        }
+        self._cached: dict[str, str] = {}
+        self._fetched = 0.0
+
+    def current(self) -> dict[str, str]:
+        found = {key: value for key, value in self.manual.items() if value}
+        if len(found) < len(self.manual):
+            for key, value in self._discover().items():
+                found.setdefault(key, value)
+        return found
+
+    def _discover(self) -> dict[str, str]:
+        """Ask the local tunnel API which public address maps to which port."""
+        if time.time() - self._fetched < TUNNEL_CACHE_SECONDS:
+            return self._cached
+        self._fetched = time.time()
+        self._cached = {}
+        if not self.api:
+            return self._cached
+        try:
+            with urllib.request.urlopen(self.api, timeout=TUNNEL_TIMEOUT) as response:
+                payload = json.loads(response.read(TUNNEL_MAX_BYTES))
+        except Exception:
+            return self._cached
+        for tunnel in payload.get("tunnels") or []:
+            if not isinstance(tunnel, dict) or tunnel.get("proto") != "tcp":
+                continue
+            public = str(tunnel.get("public_url") or "").rsplit("//", 1)[-1]
+            forwards = str((tunnel.get("config") or {}).get("addr") or "")
+            _, _, local_port = forwards.rpartition(":")
+            if not public or not local_port.isdigit():
+                continue
+            for key, port in self.local_ports.items():
+                if int(local_port) == port:
+                    self._cached[key] = public
+        return self._cached
+
+
 def run(args: list[str], timeout: int = 60) -> tuple[int, str]:
     try:
         proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
@@ -124,6 +204,7 @@ class Controller:
         self.screen = config.get("screen_name", "minecraft")
         self.start_command = config.get("start_command", "")
         self.server_dir = pathlib.Path(config["server_dir"]).resolve()
+        self.endpoints = EndpointProbe(config)
         self.managed: subprocess.Popen | None = None
         if self.mode == "auto":
             self.mode = self._detect()
@@ -163,6 +244,8 @@ class Controller:
             "server_dir": str(self.server_dir),
             "writable": writes_allowed(self.config),
         }
+        if endpoints := self.endpoints.current():
+            info["endpoints"] = endpoints
         with contextlib.suppress(OSError):
             usage = shutil.disk_usage(self.server_dir)
             info["disk_free"], info["disk_total"] = usage.free, usage.total

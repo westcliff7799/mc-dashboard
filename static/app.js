@@ -64,17 +64,39 @@ document.querySelectorAll('.tabs button').forEach((button) => {
   });
 });
 
+const STATUS_LOOK = {
+  online: ['good', '✓', 'Online'],
+  unreachable: ['warning', '!', 'Unreachable'],
+  stopped: ['critical', '✕', 'Stopped'],
+  offline: ['critical', '✕', 'Offline'],
+};
+
+function describeFault(status, state) {
+  const where = `${status.host}:${status.port}`;
+  if (state === 'unreachable') {
+    return `The agent reports the server running, but ${where} did not answer`
+      + `${status.error ? ` (${status.error})` : ''}. `
+      + 'That address is probably stale — check the tunnel on the host machine.';
+  }
+  if (state === 'stopped') return 'The agent reports the server process is stopped.';
+  return status.error || '';
+}
+
 function renderStatus(status) {
   if (!status) return;
 
+  const state = status.state || (status.online ? 'online' : 'offline');
+  const [tone, icon, label] = STATUS_LOOK[state] || ['unknown', '•', 'Checking…'];
   const pill = $('status-pill');
-  pill.className = `pill ${status.online ? 'good' : 'critical'}`;
-  $('status-icon').textContent = status.online ? '✓' : '✕';
-  $('status-text').textContent = status.online ? 'Online' : 'Offline';
+  pill.className = `pill ${tone}`;
+  $('status-icon').textContent = icon;
+  $('status-text').textContent = label;
 
   $('checked-at').textContent = status.checked_at ? `checked ${clock(status.checked_at)}` : '';
-  $('motd').textContent = status.online ? (status.motd || '') : (status.error || '');
-  $('host').textContent = `${status.host}:${status.port}`;
+  $('motd').textContent = status.online ? (status.motd || '') : describeFault(status, state);
+  $('host').textContent = status.host
+    ? `${status.host}:${status.port}${status.address_source === 'agent' ? ' · via agent' : ''}`
+    : '—';
 
   $('t-players').textContent = status.online ? count(status.players_online) : '—';
   $('t-players-sub').textContent = status.online && status.players_max
@@ -85,7 +107,9 @@ function renderStatus(status) {
   const players = $('players');
   const names = status.players_sample || [];
   if (!status.online) {
-    players.innerHTML = '<span class="empty">Server is offline.</span>';
+    players.innerHTML = state === 'unreachable'
+      ? '<span class="empty">Roster needs a working address — the server itself is up.</span>'
+      : '<span class="empty">Server is offline.</span>';
   } else if (names.length === 0) {
     players.innerHTML = status.players_online > 0
       ? '<span class="empty">Names hidden — enable RCON for the full roster.</span>'

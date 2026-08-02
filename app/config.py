@@ -58,6 +58,10 @@ class Settings:
 
     poll_seconds: int = field(default_factory=lambda: _int("POLL_SECONDS", 10))
 
+    trust_agent_address: bool = field(
+        default_factory=lambda: os.environ.get("TRUST_AGENT_ADDRESS", "true").lower() == "true"
+    )
+
     max_upload_mb: int = field(default_factory=lambda: _int("MAX_UPLOAD_MB", 512))
 
     @property
