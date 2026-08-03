@@ -44,6 +44,7 @@ import subprocess
 import tarfile
 import time
 import urllib.request
+import zipfile
 from typing import Any, BinaryIO, TextIO
 
 try:
@@ -58,6 +59,8 @@ MAX_WRITE_BYTES = 1024 * 1024
 CHUNK_BYTES = 256 * 1024
 DEFAULT_MAX_UPLOAD_MB = 512
 UPLOAD_IDLE_SECONDS = 600
+MAX_ARCHIVE_ENTRIES = 20000
+SYMLINK_MODE = 0o120000
 UPLOAD_SUFFIX = ".dashboard-upload"
 WRITE_SUFFIX = ".dashboard-tmp"
 FREE_SPACE_MARGIN = 64 * 1024 * 1024
@@ -535,6 +538,116 @@ def make_directory(server_dir: pathlib.Path, relative: str) -> dict:
     return {"path": relative_to_root(server_dir, target)}
 
 
+def member_target(destination: pathlib.Path, name: str) -> pathlib.Path:
+    """Where one archive member is allowed to land.
+
+    Member names come from whoever built the zip, not from the dashboard, so
+    they are the one path in this file that no amount of checking upstream can
+    vouch for. `../../server.properties` and `/etc/cron.d/x` are both legal
+    strings in the format, and both are refused here rather than normalised:
+    silently rewriting an escape to something harmless would extract an archive
+    that is lying about its contents and report success.
+    """
+    cleaned = name.replace("\\", "/")
+    if cleaned.startswith("/"):
+        raise PermissionError(f"archive member has an absolute path: {name}")
+    parts = [part for part in cleaned.split("/") if part not in ("", ".")]
+    if any(part == ".." for part in parts):
+        raise PermissionError(f"archive member escapes the destination: {name}")
+    if not parts:
+        raise PermissionError(f"archive member has no name: {name}")
+
+    target = destination.joinpath(*parts)
+    if destination not in target.parents:
+        raise PermissionError(f"archive member escapes the destination: {name}")
+    return target
+
+
+def extract_mkdir(destination: pathlib.Path, target: pathlib.Path) -> None:
+    """Create the levels of `target` under `destination`, following no symlink.
+
+    Checked one level at a time rather than with parents=True, because a symlink
+    already sitting inside the destination would otherwise be followed out of
+    the tree by the mkdir itself.
+    """
+    walked = destination
+    for part in target.relative_to(destination).parts:
+        walked = walked / part
+        if walked.is_symlink():
+            raise PermissionError(f"refusing to extract through a symlink: {part}")
+        walked.mkdir(exist_ok=True)
+
+
+def extract_archive(
+    server_dir: pathlib.Path, relative: str, destination_relative: str, limit_bytes: int
+) -> dict:
+    """Unpack a .zip into a directory inside the tree.
+
+    Three things an archive can do that a plain upload cannot, all refused:
+    point a member outside the destination (see member_target), carry a symlink
+    that would later be written through, and declare a modest compressed size
+    that expands to fill the disk. The last is why the running total is checked
+    against the budget as bytes are copied rather than trusting the sizes in the
+    central directory, which the archive itself supplies.
+    """
+    archive = safe_path(server_dir, relative)
+    if not archive.is_file():
+        raise FileNotFoundError(relative)
+    if archive.suffix.lower() != ".zip":
+        raise ValueError(f"{archive.name} is not a .zip file")
+
+    destination = safe_leaf(server_dir, destination_relative)
+    if destination.is_symlink():
+        raise PermissionError("refusing to extract through a symlink")
+    if destination.exists() and not destination.is_dir():
+        raise NotADirectoryError(destination_relative)
+
+    with zipfile.ZipFile(archive) as bundle:
+        members = bundle.infolist()
+        if len(members) > MAX_ARCHIVE_ENTRIES:
+            raise ValueError(
+                f"archive holds {len(members)} entries; this agent extracts at most "
+                f"{MAX_ARCHIVE_ENTRIES}"
+            )
+        for member in members:
+            if (member.external_attr >> 16) & 0o170000 == SYMLINK_MODE:
+                raise PermissionError(f"archive contains a symlink: {member.filename}")
+
+        declared = sum(member.file_size for member in members)
+        if declared > limit_bytes:
+            raise ValueError(
+                f"archive expands to {declared} bytes; this agent accepts at most {limit_bytes}"
+            )
+        free = shutil.disk_usage(destination.parent).free
+        if declared + FREE_SPACE_MARGIN > free:
+            raise OSError(f"not enough room: {free} bytes free, {declared} needed")
+
+        destination.mkdir(exist_ok=True)
+        files = 0
+        written = 0
+        for member in members:
+            target = member_target(destination, member.filename)
+            if member.is_dir():
+                extract_mkdir(destination, target)
+                continue
+            extract_mkdir(destination, target.parent)
+            if target.is_symlink():
+                raise PermissionError(f"refusing to overwrite a symlink: {member.filename}")
+            with bundle.open(member) as source, target.open("wb") as sink:
+                while blob := source.read(CHUNK_BYTES):
+                    written += len(blob)
+                    if written > limit_bytes:
+                        raise ValueError(f"archive expands past the {limit_bytes} byte limit")
+                    sink.write(blob)
+            files += 1
+
+    return {
+        "path": relative_to_root(server_dir, destination),
+        "files": files,
+        "size": written,
+    }
+
+
 def move_path(server_dir: pathlib.Path, relative: str, destination: str) -> dict:
     """Rename or move one entry, both ends confined to the tree.
 
@@ -727,6 +840,7 @@ def list_backups(config: dict, server_dir: pathlib.Path) -> dict:
 MUTATING_ACTIONS = frozenset({
     "write_file", "make_directory", "move_path", "delete_paths",
     "upload_begin", "upload_chunk", "upload_commit", "upload_abort",
+    "extract_archive",
 })
 
 
@@ -779,6 +893,10 @@ async def handle_command(
         if action == "move_path":
             return {"ok": True, **move_path(
                 server_dir, message.get("path", ""), message.get("to", "")
+            )}
+        if action == "extract_archive":
+            return {"ok": True, **extract_archive(
+                server_dir, message.get("path", ""), message.get("to", ""), uploads.limit
             )}
         if action == "delete_paths":
             return {"ok": True, **delete_paths(server_dir, message.get("paths"))}

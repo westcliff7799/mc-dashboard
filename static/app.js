@@ -211,10 +211,12 @@ function applyCapabilities() {
   $('cmd-send').disabled = !capabilities.rcon || !can('console.command');
 
   $('btn-file-upload').hidden = !can('files.write');
+  $('btn-file-upload-folder').hidden = !can('files.write');
   $('btn-file-folder').hidden = !can('files.write');
   $('btn-file-new').hidden = !can('files.write');
   $('btn-file-rename').hidden = !can('files.write');
   $('btn-file-delete').hidden = !can('files.delete');
+  $('btn-file-unzip').hidden = !can('files.write');
   $('btn-file-download').hidden = !can('files.read');
   updateFileControls();
 
@@ -446,10 +448,12 @@ function updateFileControls() {
 
   $('btn-file-refresh').disabled = !agent;
   $('btn-file-upload').disabled = !write;
+  $('btn-file-upload-folder').disabled = !write;
   $('btn-file-folder').disabled = !write;
   $('btn-file-new').disabled = !write;
   $('btn-file-rename').disabled = !write || !single;
   $('btn-file-delete').disabled = !mayDeleteFiles() || chosen.length === 0;
+  $('btn-file-unzip').disabled = !write || !isArchive(single);
   $('btn-file-download').disabled = !can('files.read') || !agent || !single || single.dir;
 
   const blocked = can('files.write') || can('files.delete');
@@ -578,6 +582,34 @@ async function deleteSelected() {
   }
 }
 
+function isArchive(entry) {
+  return Boolean(entry) && !entry.dir && /\.zip$/i.test(entry.name);
+}
+
+async function unzipSelected() {
+  const [entry] = selectedEntries();
+  if (!isArchive(entry)) return;
+
+  const stem = entry.name.replace(/\.zip$/i, '');
+  const name = (prompt('Unzip into which folder?', stem) || '').trim();
+  if (!name) return;
+
+  const button = $('btn-file-unzip');
+  button.disabled = true;
+  try {
+    const result = await post('/api/files/extract', {
+      path: entry.path,
+      to: joinPath(currentDir, name),
+    });
+    toast(`Unzipped ${result.files} files into ${result.path}`);
+    loadFiles(currentDir);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    updateFileControls();
+  }
+}
+
 function downloadSelected() {
   const [entry] = selectedEntries();
   if (!entry || entry.dir) return;
@@ -589,12 +621,78 @@ function downloadSelected() {
   link.remove();
 }
 
-function uploadOne(file, overwrite) {
+const MAX_FOLDER_DEPTH = 32;
+
+function joinPath(base, extra) {
+  if (!extra) return base;
+  return base ? `${base}/${extra}` : extra;
+}
+
+function writeBlocker() {
+  if (!can('files.write')) return 'You do not have permission to change files.';
+  if (!capabilities.agent) return 'The agent is not connected.';
+  if (agentWritable === false) return 'The agent is running read-only.';
+  return '';
+}
+
+function readBatch(reader) {
+  return new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+}
+
+function readEntryFile(entry) {
+  return new Promise((resolve, reject) => entry.file(resolve, reject));
+}
+
+async function walkEntry(entry, prefix, found) {
+  if (entry.isFile) {
+    found.files.push({ file: await readEntryFile(entry), dir: prefix });
+    return;
+  }
+  if (!entry.isDirectory) return;
+
+  const dir = joinPath(prefix, entry.name);
+  if (dir.split('/').length > MAX_FOLDER_DEPTH) throw new Error(`${dir}: nested too deeply`);
+  found.dirs.add(dir);
+
+  const reader = entry.createReader();
+  for (;;) {
+    const batch = await readBatch(reader);
+    if (!batch.length) break;
+    for (const child of batch) await walkEntry(child, dir, found);
+  }
+}
+
+async function droppedItems(transfer) {
+  const roots = Array.from(transfer.items || [])
+    .map((item) => (item.webkitGetAsEntry ? item.webkitGetAsEntry() : null))
+    .filter(Boolean);
+
+  const found = { files: [], dirs: new Set() };
+  if (!roots.length) {
+    Array.from(transfer.files || []).forEach((file) => found.files.push({ file, dir: '' }));
+    return found;
+  }
+  for (const root of roots) await walkEntry(root, '', found);
+  return found;
+}
+
+function pickedItems(list) {
+  const found = { files: [], dirs: new Set() };
+  Array.from(list || []).forEach((file) => {
+    const relative = (file.webkitRelativePath || '').replace(/\\/g, '/');
+    const cut = relative.lastIndexOf('/');
+    found.files.push({ file, dir: cut > 0 ? relative.slice(0, cut) : '' });
+  });
+  return found;
+}
+
+function uploadOne(item, overwrite) {
   return new Promise((resolve, reject) => {
+    const label = joinPath(item.dir, item.file.name);
     const form = new FormData();
-    form.append('path', currentDir);
+    form.append('path', joinPath(currentDir, item.dir));
     form.append('overwrite', overwrite ? 'true' : 'false');
-    form.append('upload', file, file.name);
+    form.append('upload', item.file, item.file.name);
 
     const request = new XMLHttpRequest();
     request.open('POST', '/api/files/upload');
@@ -606,48 +704,71 @@ function uploadOne(file, overwrite) {
       try { data = JSON.parse(request.responseText); } catch { }
       if (request.status === 401) { window.location.href = '/login'; return; }
       if (request.status >= 200 && request.status < 300) resolve(data);
-      else reject(new Error(data.detail || `HTTP ${request.status}`));
+      else reject(new Error(`${label}: ${data.detail || `HTTP ${request.status}`}`));
     });
-    request.addEventListener('error', () => reject(new Error(`${file.name}: the upload failed`)));
-    request.addEventListener('abort', () => reject(new Error(`${file.name}: upload cancelled`)));
+    request.addEventListener('error', () => reject(new Error(`${label}: the upload failed`)));
+    request.addEventListener('abort', () => reject(new Error(`${label}: upload cancelled`)));
     request.send(form);
   });
 }
 
-async function uploadFiles(list) {
-  const files = Array.from(list || []);
-  if (!files.length || !mayWriteFiles()) return;
+async function uploadAll(found) {
+  const items = found.files;
+  const folders = new Set(found.dirs);
+  items.forEach((item) => { if (item.dir) folders.add(item.dir); });
+  if (!items.length && !folders.size) return;
 
-  const here = new Set(currentEntries.filter((entry) => !entry.dir).map((entry) => entry.name));
-  const clashes = files.filter((file) => here.has(file.name)).map((file) => file.name);
-  if (clashes.length && !confirm(`Overwrite ${clashes.join(', ')}?`)) return;
+  const blocker = writeBlocker();
+  if (blocker) { toast(blocker, true); return; }
+
+  const here = new Set(currentEntries.map((entry) => entry.name));
+  const top = (item) => (item.dir || item.file.name).split('/')[0];
+  const roots = new Set([...items.map(top), ...[...folders].map((dir) => dir.split('/')[0])]);
+  const clashes = [...roots].filter((name) => here.has(name));
+  if (clashes.length
+    && !confirm(`${clashes.join(', ')} already exists here.\n\nContinue? Matching files are replaced.`)) {
+    return;
+  }
+  const replacing = new Set(clashes);
 
   $('upload-row').hidden = false;
   try {
-    for (const [index, file] of files.entries()) {
-      $('upload-name').textContent = files.length > 1
-        ? `${file.name} — ${index + 1} of ${files.length}`
-        : file.name;
+    for (const folder of [...folders].sort()) {
+      $('upload-name').textContent = folder;
       $('upload-bar').value = 0;
-      await uploadOne(file, here.has(file.name));
+      await post('/api/files/folders', { path: joinPath(currentDir, folder) });
     }
-    toast(files.length === 1 ? `Uploaded ${files[0].name}` : `Uploaded ${files.length} files`);
+    for (const [index, item] of items.entries()) {
+      const label = joinPath(item.dir, item.file.name);
+      $('upload-name').textContent = items.length > 1
+        ? `${label} — ${index + 1} of ${items.length}`
+        : label;
+      $('upload-bar').value = 0;
+      await uploadOne(item, replacing.has(top(item)));
+    }
+    if (items.length === 1) toast(`Uploaded ${joinPath(items[0].dir, items[0].file.name)}`);
+    else if (items.length) toast(`Uploaded ${items.length} files`);
+    else toast(`Created ${[...folders].sort()[0]}`);
   } catch (error) {
     toast(error.message, true);
   } finally {
     $('upload-row').hidden = true;
     $('file-input').value = '';
+    $('folder-input').value = '';
     loadFiles(currentDir);
   }
 }
 
 $('btn-file-refresh').addEventListener('click', () => loadFiles(currentDir));
 $('btn-file-upload').addEventListener('click', () => $('file-input').click());
-$('file-input').addEventListener('change', (event) => uploadFiles(event.target.files));
+$('btn-file-upload-folder').addEventListener('click', () => $('folder-input').click());
+$('file-input').addEventListener('change', (event) => uploadAll(pickedItems(event.target.files)));
+$('folder-input').addEventListener('change', (event) => uploadAll(pickedItems(event.target.files)));
 $('btn-file-folder').addEventListener('click', newFolder);
 $('btn-file-new').addEventListener('click', newFile);
 $('btn-file-rename').addEventListener('click', renameSelected);
 $('btn-file-delete').addEventListener('click', deleteSelected);
+$('btn-file-unzip').addEventListener('click', unzipSelected);
 $('btn-file-download').addEventListener('click', downloadSelected);
 $('btn-editor-close').addEventListener('click', closeEditor);
 $('btn-editor-save').addEventListener('click', saveFile);
@@ -675,7 +796,9 @@ dropzone.addEventListener('drop', (event) => {
   dropzone.classList.remove('over');
   if (!mayWriteFiles()) return;
   event.preventDefault();
-  uploadFiles(event.dataTransfer.files);
+  droppedItems(event.dataTransfer)
+    .then(uploadAll)
+    .catch((error) => toast(error.message, true));
 });
 
 async function loadBackups() {

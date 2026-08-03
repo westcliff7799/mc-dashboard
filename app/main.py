@@ -464,6 +464,8 @@ async def api_logs(_: str = Depends(require(permissions.CONSOLE_VIEW))):
 
 FILE_CHUNK_BYTES = 256 * 1024
 UPLOAD_TIMEOUT = 120.0
+EXTRACT_TIMEOUT = 300.0
+MAX_FOLDER_DEPTH = 32
 
 UNSAFE_FILENAME = re.compile(r"[^A-Za-z0-9._-]")
 
@@ -590,6 +592,40 @@ async def api_file_mkdir(payload: dict, user: str = Depends(require(permissions.
     return result
 
 
+@app.post("/api/files/folders")
+async def api_file_mkdirs(payload: dict, user: str = Depends(require(permissions.FILES_WRITE))):
+    """Create a nested path, one level at a time, treating an existing level as done.
+
+    Uploading a folder means its whole subtree has to exist before the first file
+    can land in it, and the agent's make_directory builds exactly one level: its
+    safe_leaf() insists the parent is already a directory, and it refuses a path
+    that is there. So the walk happens out here, and a level that already exists
+    is the ordinary case rather than a failure — dropping a second datapack into
+    a tree that shares a folder with the first must not be an error.
+    """
+    relative = clean_relative(payload.get("path"))
+    if not relative:
+        raise HTTPException(400, "a path is required")
+
+    segments = relative.split("/")
+    if len(segments) > MAX_FOLDER_DEPTH:
+        raise HTTPException(400, f"paths cannot nest deeper than {MAX_FOLDER_DEPTH} levels")
+
+    created: list[str] = []
+    walked = ""
+    for segment in segments:
+        walked = join_relative(walked, clean_name(segment))
+        reply = await ask_agent("make_directory", path=walked)
+        if reply.get("ok"):
+            created.append(walked)
+        elif not str(reply.get("error") or "").startswith("FileExistsError"):
+            agent_result(reply)
+
+    if created:
+        await audit(user, f"created folder {created[-1]}")
+    return {"path": relative, "created": created}
+
+
 @app.post("/api/files/rename")
 async def api_file_rename(payload: dict, user: str = Depends(require(permissions.FILES_WRITE))):
     """Rename in place, or move by giving a `to` that contains a slash."""
@@ -607,6 +643,39 @@ async def api_file_rename(payload: dict, user: str = Depends(require(permissions
 
     result = agent_result(await ask_agent("move_path", path=source, to=destination))
     await audit(user, f"renamed {source} → {result.get('path', destination)}")
+    return result
+
+
+@app.post("/api/files/extract")
+async def api_file_extract(payload: dict, user: str = Depends(require(permissions.FILES_WRITE))):
+    """Unpack a .zip already sitting in the tree, into a folder beside it.
+
+    Extracting on the server machine rather than in the browser is the whole
+    point: a datapack or modpack arrives as one upload instead of a few hundred,
+    which over a WebSocket to someone else's machine is the difference between a
+    moment and several minutes.
+    """
+    source = clean_relative(payload.get("path"))
+    if not source:
+        raise HTTPException(400, "a path is required")
+
+    requested = payload.get("to")
+    if requested:
+        destination = clean_relative(requested)
+    else:
+        stem = posixpath.splitext(posixpath.basename(source))[0]
+        destination = join_relative(posixpath.dirname(source), clean_name(stem))
+    if not destination:
+        raise HTTPException(400, "a destination is required")
+
+    result = agent_result(
+        await ask_agent("extract_archive", timeout=EXTRACT_TIMEOUT, path=source, to=destination)
+    )
+    await audit(
+        user,
+        f"unzipped {source} into {result.get('path', destination)} "
+        f"({result.get('files', 0)} files, {result.get('size', 0)} bytes)",
+    )
     return result
 
 

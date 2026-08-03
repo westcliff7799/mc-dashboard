@@ -123,15 +123,18 @@
         <div class="actions file-actions">
           <button class="action" id="btn-file-refresh">Refresh</button>
           <button class="action" id="btn-file-upload">Upload…</button>
+          <button class="action" id="btn-file-upload-folder">Upload folder…</button>
           <button class="action" id="btn-file-folder">New folder</button>
           <button class="action" id="btn-file-new">New file</button>
           <span class="spacer"></span>
+          <button class="action" id="btn-file-unzip">Unzip</button>
           <button class="action" id="btn-file-download">Download</button>
           <button class="action" id="btn-file-rename">Rename</button>
           <button class="action danger" id="btn-file-delete">Delete</button>
         </div>
 
         <input type="file" id="file-input" multiple hidden>
+        <input type="file" id="folder-input" webkitdirectory multiple hidden>
 
         <div class="upload" id="upload-row" hidden>
           <span class="upload-name" id="upload-name"></span>
@@ -140,7 +143,7 @@
 
         <div class="dropzone" id="dropzone">
           <table class="files" id="file-table"></table>
-          <div class="drop-hint" id="drop-hint" aria-hidden="true">Drop to upload here</div>
+          <div class="drop-hint" id="drop-hint" aria-hidden="true">Drop files or folders here</div>
         </div>
 
         <div class="editor" id="editor" hidden>
