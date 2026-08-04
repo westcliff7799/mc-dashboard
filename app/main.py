@@ -40,6 +40,12 @@ status_cache: dict[str, Any] = {
 
 _last_target: tuple[str, int, str] | None = None
 
+RCON_PROBE_TIMEOUT = 5.0
+RCON_PROBE_SECONDS = 30.0
+
+_rcon_last: dict[str, Any] = {}
+_rcon_probed_at = 0.0
+
 
 def parse_address(raw: Any) -> tuple[str, int] | None:
     """Split a reported "host:port" pair, or None if it is not one."""
@@ -95,8 +101,44 @@ def derive_state(online: bool) -> str:
     return "offline"
 
 
+async def probe_rcon() -> dict[str, Any]:
+    """Ask RCON for the player list, on its own slower clock than the ping.
+
+    Minecraft logs a thread start and a shutdown for every RCON connection, and
+    app/rcon.py opens one per command by design, so probing on every poll writes
+    six start/stop pairs a minute into the server console forever. A player
+    count does not need ten-second freshness. The ping still runs each tick, so
+    online/offline is as responsive as it was.
+
+    The caller holds the returned dict between probes rather than recomputing
+    it, which is also what keeps the RCON tier from dropping out on the ticks
+    that do not probe.
+    """
+    rcon_host, rcon_port, _ = resolve_target("rcon")
+    try:
+        output = await rcon.execute(
+            rcon_host,
+            rcon_port,
+            settings.rcon_password,
+            "list",
+            timeout=RCON_PROBE_TIMEOUT,
+        )
+    except Exception as exc:
+        return {"rcon_ok": False, "rcon_error": str(exc)}
+
+    online, maximum, names = rcon.parse_player_list(output)
+    probed: dict[str, Any] = {
+        "rcon_ok": True,
+        "players_sample": names,
+        "players_source": "rcon",
+    }
+    if maximum:
+        probed["players_online"], probed["players_max"] = online, maximum
+    return probed
+
+
 async def poll_once() -> dict[str, Any]:
-    global _last_target
+    global _last_target, _rcon_last, _rcon_probed_at
 
     host, port, source = resolve_target("mc")
     result = await ping.ping(host, port)
@@ -110,26 +152,16 @@ async def poll_once() -> dict[str, Any]:
         )
     _last_target = target
 
-    if result["online"] and settings.rcon_enabled:
-        rcon_host, rcon_port, _ = resolve_target("rcon")
-        try:
-            output = await rcon.execute(
-                rcon_host,
-                rcon_port,
-                settings.rcon_password,
-                "list",
-            )
-            online, maximum, names = rcon.parse_player_list(output)
-            result["players_sample"] = names
-            result["players_source"] = "rcon"
-            if maximum:
-                result["players_online"], result["players_max"] = online, maximum
-            result["rcon_ok"] = True
-        except Exception as exc:
-            result["rcon_ok"] = False
-            result["rcon_error"] = str(exc)
+    result["players_source"] = "ping"
+    stopped = hub.connected and hub.state.get("running") is False
+    if settings.rcon_enabled and not stopped:
+        if result["checked_at"] - _rcon_probed_at >= RCON_PROBE_SECONDS:
+            _rcon_probed_at = result["checked_at"]
+            _rcon_last = await probe_rcon()
+        result.update(_rcon_last)
     else:
-        result["players_source"] = "ping"
+        _rcon_probed_at = 0.0
+        _rcon_last = {}
 
     result["tiers"] = {
         "ping": True,
@@ -423,9 +455,10 @@ async def api_command(payload: dict, user: str = Depends(require(permissions.CON
         raise HTTPException(400, "empty command")
     if not settings.rcon_enabled:
         raise HTTPException(409, "RCON is not configured on this dashboard")
+    rcon_host, rcon_port, _ = resolve_target("rcon")
     try:
         output = await rcon.execute(
-            settings.effective_rcon_host, settings.rcon_port, settings.rcon_password, command
+            rcon_host, rcon_port, settings.rcon_password, command
         )
     except Exception as exc:
         raise HTTPException(502, f"RCON failed: {exc}")
