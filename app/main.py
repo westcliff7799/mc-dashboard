@@ -540,6 +540,152 @@ async def api_file_read(path: str, _: str = Depends(require(permissions.FILES_RE
     return agent_result(await ask_agent("read_file", path=clean_relative(path)))
 
 
+LEGACY_CONTENT_DIRS = {
+    "advancements": "advancement",
+    "functions": "function",
+    "item_modifiers": "item_modifier",
+    "loot_tables": "loot_table",
+    "predicates": "predicate",
+    "recipes": "recipe",
+    "structures": "structure",
+}
+SINGULAR_SINCE_FORMAT = 48
+MAX_PACKS_INSPECTED = 25
+
+
+async def listing(path: str) -> list[dict]:
+    reply = await ask_agent("list_files", path=path)
+    if not reply.get("ok"):
+        raise FileNotFoundError(reply.get("error") or path)
+    return reply.get("entries") or []
+
+
+async def level_name() -> str:
+    with contextlib.suppress(Exception):
+        reply = await ask_agent("read_file", path="server.properties")
+        if reply.get("ok"):
+            for line in str(reply.get("content") or "").splitlines():
+                key, sep, value = line.partition("=")
+                if sep and key.strip() == "level-name" and value.strip():
+                    return value.strip()
+    return "world"
+
+
+def pack_format_of(text: str) -> int | None:
+    with contextlib.suppress(Exception):
+        pack = json.loads(text).get("pack") or {}
+        value = pack.get("pack_format")
+        if isinstance(value, int):
+            return value
+    return None
+
+
+async def inspect_pack(base: str, entry: dict) -> dict:
+    name = entry.get("name") or ""
+    where = f"{base}/{name}"
+    report: dict[str, Any] = {"name": name, "problems": [], "notes": []}
+
+    if not entry.get("dir"):
+        if name.lower().endswith(".zip"):
+            report["notes"].append("zip archive — contents not inspected, but this form is valid")
+        else:
+            report["problems"].append(
+                "not a folder or a .zip, so Minecraft ignores it entirely"
+            )
+        return report
+
+    children = {child.get("name"): child for child in await listing(where)}
+
+    if "pack.mcmeta" not in children:
+        nested = [c for c in children.values() if c.get("dir")]
+        if len(nested) == 1 and nested[0].get("name"):
+            inner = nested[0]["name"]
+            report["problems"].append(
+                f"no pack.mcmeta here — it looks nested one level too deep in {inner}/. "
+                f"Move the contents of {name}/{inner}/ up into {name}/"
+            )
+        else:
+            report["problems"].append("no pack.mcmeta — Minecraft will not see this as a datapack")
+        return report
+
+    fmt = None
+    with contextlib.suppress(Exception):
+        meta = await ask_agent("read_file", path=f"{where}/pack.mcmeta")
+        if meta.get("ok"):
+            fmt = pack_format_of(str(meta.get("content") or ""))
+            if fmt is None:
+                report["problems"].append("pack.mcmeta has no readable pack_format")
+    if fmt is not None:
+        report["pack_format"] = fmt
+
+    if "data" not in children or not children["data"].get("dir"):
+        report["problems"].append(
+            "no data/ folder beside pack.mcmeta — the pack loads but contains nothing"
+        )
+        return report
+
+    namespaces = [c for c in await listing(f"{where}/data") if c.get("dir")]
+    if not namespaces:
+        report["problems"].append("data/ is empty — the pack loads but contains nothing")
+        return report
+
+    for namespace in namespaces:
+        ns = namespace.get("name") or ""
+        if ns != ns.lower():
+            report["problems"].append(f"namespace {ns} must be lowercase")
+        for child in await listing(f"{where}/data/{ns}"):
+            folder = child.get("name") or ""
+            if child.get("dir") and folder in LEGACY_CONTENT_DIRS:
+                if fmt is None or fmt >= SINGULAR_SINCE_FORMAT:
+                    report["problems"].append(
+                        f"data/{ns}/{folder}/ uses the pre-1.21 plural name — "
+                        f"rename it to {LEGACY_CONTENT_DIRS[folder]}/ or nothing in it loads"
+                    )
+    return report
+
+
+@app.get("/api/datapacks/check")
+async def api_datapack_check(_: str = Depends(require(permissions.FILES_READ))):
+    world = await level_name()
+    base = f"{world}/datapacks"
+    try:
+        entries = await listing(base)
+    except Exception:
+        return {
+            "world": world,
+            "path": base,
+            "found": False,
+            "packs": [],
+            "summary": f"No {base}/ folder. level-name in server.properties is '{world}', "
+                       f"so that is where Minecraft looks for datapacks.",
+        }
+
+    packs = []
+    for entry in entries[:MAX_PACKS_INSPECTED]:
+        if str(entry.get("name") or "").startswith("."):
+            continue
+        try:
+            packs.append(await inspect_pack(base, entry))
+        except Exception as exc:
+            packs.append({"name": entry.get("name"), "problems": [str(exc)], "notes": []})
+
+    broken = sum(1 for pack in packs if pack["problems"])
+    if not packs:
+        summary = f"{base}/ is empty."
+    elif broken:
+        summary = f"{broken} of {len(packs)} would not load."
+    else:
+        summary = f"All {len(packs)} look structurally valid — restart the server to load them."
+    return {
+        "world": world,
+        "path": base,
+        "found": True,
+        "packs": packs,
+        "truncated": len(entries) > MAX_PACKS_INSPECTED,
+        "summary": summary,
+    }
+
+
 def disposition(name: str) -> str:
     """A Content-Disposition value that a filename cannot break out of.
 

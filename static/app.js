@@ -128,29 +128,40 @@ function renderStatus(status) {
   if (status.agent_state) renderAgentState(status.agent_state);
 }
 
+function setNotice(noticeId, textId, headline, body) {
+  const notice = $(noticeId);
+  if (!headline) {
+    notice.hidden = true;
+    return;
+  }
+  const target = $(textId);
+  target.textContent = '';
+  const strong = document.createElement('strong');
+  strong.textContent = headline;
+  target.append(strong, ` ${body}`);
+  notice.hidden = false;
+}
+
 function renderAgentVersion(state) {
-  const notice = $('agent-version-notice');
   const expected = capabilities.agent_expected_version;
   if (!capabilities.agent || !expected) {
-    notice.hidden = true;
+    setNotice('agent-version-notice', 'agent-version-text', null);
     return;
   }
   const running = state && state.version;
   if (!running) {
-    $('agent-version-text').innerHTML = '<strong>Agent version unknown.</strong> '
-      + `This agent predates version reporting; the dashboard expects ${expected}. `
-      + 'Update mc-agent.py on the server machine.';
-    notice.hidden = false;
+    setNotice('agent-version-notice', 'agent-version-text', 'Agent version unknown.',
+      `This agent predates version reporting; the dashboard expects ${expected}. `
+      + 'Update mc-agent.py on the server machine.');
     return;
   }
   if (running !== expected) {
-    $('agent-version-text').innerHTML = `<strong>Agent is v${running}, `
-      + `dashboard expects v${expected}.</strong> `
-      + 'Copy the current mc-agent.py to the server machine and restart it.';
-    notice.hidden = false;
+    setNotice('agent-version-notice', 'agent-version-text',
+      `Agent is v${running}, dashboard expects v${expected}.`,
+      'Copy the current mc-agent.py to the server machine and restart it.');
     return;
   }
-  notice.hidden = true;
+  setNotice('agent-version-notice', 'agent-version-text', null);
 }
 
 const STALE_LOG_SECONDS = 600;
@@ -160,32 +171,34 @@ function treeComplaint(state) {
   if (state.has_properties === undefined) return null;
   const dir = state.server_dir;
   if (state.has_properties === false) {
-    return `<strong>${dir} has no server.properties.</strong> The server is running, `
-      + 'but this is not its directory — uploads and edits here will never reach it. '
-      + 'Check <code>server_dir</code> in agent.conf against the volume the server actually reads.';
+    return {
+      headline: `${dir} has no server.properties.`,
+      body: 'The server is running, but this is not its directory — uploads and edits here '
+        + 'will never reach it. Check server_dir in agent.conf against the volume the '
+        + 'server actually reads.',
+    };
   }
   if (state.log_age === null || state.log_age === undefined) {
-    return `<strong>No logs/latest.log under ${dir}.</strong> The server is running and `
-      + 'should be writing one, so this is probably not the directory it uses. '
-      + 'Check <code>server_dir</code> in agent.conf.';
+    return {
+      headline: `No logs/latest.log under ${dir}.`,
+      body: 'The server is running and should be writing one, so this is probably not the '
+        + 'directory it uses. Check server_dir in agent.conf.',
+    };
   }
   if (state.log_age > STALE_LOG_SECONDS) {
-    return `<strong>logs/latest.log under ${dir} is ${duration(Math.round(state.log_age))} old</strong> `
-      + 'while the server is running. Either the server is idle, or this is not the '
-      + 'directory it writes to — in which case edits here never reach it.';
+    return {
+      headline: `logs/latest.log under ${dir} is ${duration(Math.round(state.log_age))} old.`,
+      body: 'The server is running. Either it is idle, or this is not the directory it '
+        + 'writes to — in which case edits here never reach it.',
+    };
   }
   return null;
 }
 
 function renderTreeNotice(state) {
-  const notice = $('agent-tree-notice');
   const complaint = capabilities.agent ? treeComplaint(state) : null;
-  if (!complaint) {
-    notice.hidden = true;
-    return;
-  }
-  $('agent-tree-text').innerHTML = complaint;
-  notice.hidden = false;
+  setNotice('agent-tree-notice', 'agent-tree-text',
+    complaint && complaint.headline, complaint && complaint.body);
 }
 
 function renderAgentState(state) {
@@ -254,6 +267,7 @@ function applyCapabilities() {
   $('btn-stop').disabled = !agent || !can('power.stop');
   $('btn-restart').disabled = !agent || !can('power.restart');
   $('btn-backup').disabled = !agent || !can('backup.create');
+  $('btn-datapack-check').disabled = !agent || !can('files.read');
   $('power-unavailable').hidden = agent;
   $('files-notice').hidden = agent;
 
@@ -551,6 +565,67 @@ function closeEditor() {
   openFilePath = null;
   $('editor').hidden = true;
   $('editor-text').value = '';
+}
+
+function para(text, className) {
+  const node = document.createElement('p');
+  node.textContent = text;
+  if (className) node.className = className;
+  return node;
+}
+
+function renderDatapackReport(report) {
+  const box = $('datapack-report');
+  box.textContent = '';
+  box.appendChild(para(report.summary));
+  if (report.found) box.appendChild(para(`Looked in ${report.path}/`, 'sub'));
+
+  (report.packs || []).forEach((pack) => {
+    const heading = para(pack.name || '?');
+    heading.style.marginTop = '10px';
+    if (pack.pack_format) {
+      const tag = document.createElement('span');
+      tag.className = 'sub';
+      tag.textContent = ` format ${pack.pack_format}`;
+      heading.appendChild(tag);
+    }
+    box.appendChild(heading);
+
+    const list = document.createElement('ul');
+    const problems = pack.problems || [];
+    const notes = pack.notes || [];
+    if (!problems.length && !notes.length) {
+      const item = document.createElement('li');
+      item.textContent = 'looks structurally valid';
+      list.appendChild(item);
+    }
+    problems.forEach((text) => {
+      const item = document.createElement('li');
+      item.textContent = `⚠ ${text}`;
+      list.appendChild(item);
+    });
+    notes.forEach((text) => {
+      const item = document.createElement('li');
+      item.textContent = text;
+      list.appendChild(item);
+    });
+    box.appendChild(list);
+  });
+
+  if (report.truncated) box.appendChild(para('Only the first 25 entries were checked.', 'sub'));
+}
+
+async function checkDatapacks() {
+  const button = $('btn-datapack-check');
+  button.disabled = true;
+  $('datapack-report').replaceChildren(para('Checking…', 'sub'));
+  try {
+    renderDatapackReport(await api('/api/datapacks/check'));
+  } catch (error) {
+    $('datapack-report').replaceChildren(para(error.message, 'sub'));
+  } finally {
+    button.disabled = false;
+  }
 }
 
 const SERVER_OWNED_FILES = [
@@ -982,6 +1057,8 @@ async function loadBackups() {
     table.innerHTML = '';
   }
 }
+
+$('btn-datapack-check').addEventListener('click', checkDatapacks);
 
 $('btn-backup').addEventListener('click', async () => {
   const button = $('btn-backup');
