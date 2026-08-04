@@ -1,34 +1,3 @@
-"""Minecraft dashboard agent — runs on the machine hosting the server.
-
-Connects OUTBOUND to the dashboard over wss:// and holds the socket open, so
-this machine needs no port forwarding, no static IP, and no inbound firewall
-rule. Everything it can do is bounded by SERVER_DIR and the four power actions;
-it is not a general remote shell.
-
-    pip install websockets
-    python3 mc-agent.py --config agent.conf
-
-Config file (INI-style `key = value`, or use environment variables):
-
-    dashboard_url = wss://mc.example.com/agent/ws
-    token         = <same AGENT_TOKEN as the dashboard>
-    server_dir    = /home/minecraft/server
-    mode          = auto          ; auto | systemd | docker | screen | managed
-    service_name  = minecraft     ; systemd unit  (mode=systemd)
-    container     = minecraft     ; container name (mode=docker)
-    screen_name   = minecraft     ; screen session (mode=screen)
-    start_command = java -Xmx4G -jar server.jar nogui   ; (mode=managed)
-    backup_dir    = /home/minecraft/backups
-    backup_keep   = 7
-    allow_writes  = no            ; opt in before the dashboard may change files
-    max_upload_mb = 512           ; largest single upload accepted
-    tunnel_api    = http://127.0.0.1:4040/api/tunnels   ; ngrok's local API
-    server_port   = 25565         ; local port the tunnel forwards to
-    rcon_port     = 25575
-    public_mc     = 2.tcp.ngrok.io:11591   ; skip discovery, state it outright
-    public_rcon   = 4.tcp.ngrok.io:17554
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -99,13 +68,6 @@ def truthy(value: str | None, default: bool) -> bool:
 
 
 def writes_allowed(config: dict[str, str]) -> bool:
-    """Whether this machine's owner has opted in to file modification.
-
-    Off unless the config says otherwise, because earlier versions of this agent
-    could only read, and the README promised exactly that. Dropping in a newer
-    script should not quietly widen what the dashboard may do to someone's
-    files — that has to be a decision they make in their own config.
-    """
     return truthy(config.get("allow_writes"), False)
 
 
@@ -125,19 +87,6 @@ def port_or(raw: str | None, default: int) -> int:
 
 
 class EndpointProbe:
-    """The public address this machine is currently reachable on.
-
-    A tunnel hands out a fresh host:port every time it restarts. The dashboard
-    cannot see that happen from the outside — a reassigned address and a
-    stopped server both just stop answering — but the tunnel's own local API
-    can, and it is on this side of the connection. Reporting the address
-    upward is what keeps the dashboard pointed at the right place without
-    anyone hand-editing a config after every restart.
-
-    Best effort throughout: no tunnel, no API, or an API that answers with
-    something unexpected simply means no address is reported and the dashboard
-    falls back to what its own config says.
-    """
 
     def __init__(self, config: dict[str, str]) -> None:
         self.api = config.get("tunnel_api", TUNNEL_API_DEFAULT).strip()
@@ -160,7 +109,6 @@ class EndpointProbe:
         return found
 
     def _discover(self) -> dict[str, str]:
-        """Ask the local tunnel API which public address maps to which port."""
         if time.time() - self._fetched < TUNNEL_CACHE_SECONDS:
             return self._cached
         self._fetched = time.time()
@@ -198,7 +146,6 @@ def run(args: list[str], timeout: int = 60) -> tuple[int, str]:
 
 
 class Controller:
-    """Knows how to start/stop/inspect the server, whatever form it takes."""
 
     def __init__(self, config: dict[str, str]) -> None:
         self.config = config
@@ -304,7 +251,6 @@ class Controller:
         return True, f"started (pid {self.managed.pid})"
 
     def stop(self) -> tuple[bool, str]:
-        """Always try a graceful in-game `stop` first so chunks get flushed."""
         if not self.is_running():
             return True, "already stopped"
         if self.mode == "systemd":
@@ -343,7 +289,6 @@ class Controller:
         return self.start()
 
 class LogTail:
-    """Follows logs/latest.log, surviving rotation and truncation."""
 
     def __init__(self, server_dir: pathlib.Path) -> None:
         self.path = server_dir / "logs" / "latest.log"
@@ -382,11 +327,6 @@ class LogTail:
 
 
 def safe_path(server_dir: pathlib.Path, relative: str) -> pathlib.Path:
-    """Resolve `relative` inside server_dir, refusing anything that escapes it.
-
-    resolve() collapses `..` and follows symlinks, so a symlink pointing at
-    /etc/shadow fails this check just as `../../etc/shadow` does.
-    """
     target = (server_dir / relative.lstrip("/")).resolve()
     if target != server_dir and server_dir not in target.parents:
         raise PermissionError(f"path escapes server directory: {relative}")
@@ -394,19 +334,6 @@ def safe_path(server_dir: pathlib.Path, relative: str) -> pathlib.Path:
 
 
 def safe_leaf(server_dir: pathlib.Path, relative: str) -> pathlib.Path:
-    """Locate something by name without resolving the name itself.
-
-    Every operation that creates, replaces, moves or removes an entry needs a
-    path that may not exist yet, so safe_path()'s resolve() cannot vet it. The
-    parent goes through safe_path() as usual; the final component is only
-    joined on, never followed.
-
-    That difference matters twice. A symlink in the tree pointing outside it
-    stays deletable as a link — resolving first would make it un-deletable,
-    since the target it names is out of bounds. And a symlink cannot be used as
-    a back door for writes either: callers that put bytes anywhere check
-    is_symlink() and refuse, rather than following it out of the tree.
-    """
     cleaned = relative.strip().strip("/")
     if not cleaned:
         raise PermissionError("a path is required")
@@ -424,12 +351,6 @@ def relative_to_root(server_dir: pathlib.Path, target: pathlib.Path) -> str:
 
 
 def describe(server_dir: pathlib.Path, child: pathlib.Path) -> dict:
-    """One directory entry.
-
-    lstat(), not stat(), so a symlink is reported as itself: a broken one still
-    lists instead of vanishing, and the size shown is the link's rather than
-    that of whatever it points at.
-    """
     stat = child.lstat()
     return {
         "name": child.name,
@@ -463,13 +384,6 @@ def looks_binary(blob: bytes) -> bool:
 
 
 def read_file(server_dir: pathlib.Path, relative: str) -> dict:
-    """Read a text file for the editor.
-
-    Binary content is refused rather than mangled. errors="replace" would hand
-    back a jar as question marks, and saving that back through write_file()
-    would then overwrite the real bytes with the mangled ones — so anything with
-    a NUL in it is sent to the download path instead.
-    """
     target = safe_path(server_dir, relative)
     if not target.is_file():
         raise FileNotFoundError(relative)
@@ -491,12 +405,6 @@ def stat_file(server_dir: pathlib.Path, relative: str) -> dict:
 
 
 def read_chunk(server_dir: pathlib.Path, relative: str, offset: Any, length: Any) -> dict:
-    """One slice of a file, base64'd, for the download stream.
-
-    Downloads are pulled a chunk at a time rather than in one message so that a
-    600 MB world archive doesn't have to fit in a single WebSocket frame — or in
-    the memory of either end.
-    """
     target = safe_path(server_dir, relative)
     if not target.is_file():
         raise FileNotFoundError(relative)
@@ -508,13 +416,6 @@ def read_chunk(server_dir: pathlib.Path, relative: str, offset: Any, length: Any
 
 
 def replace_atomically(target: pathlib.Path, temporary: pathlib.Path) -> None:
-    """Move `temporary` onto `target`, keeping the mode `target` already had.
-
-    A rename is atomic, so a reader — the Minecraft server itself, most of the
-    time — sees either the old file or the new one, never a half-written one.
-    The mode is carried across because the temp file is created with the default
-    0644: without this, saving server.properties would quietly widen it.
-    """
     if target.exists():
         shutil.copymode(target, temporary)
     if target.is_file() and os.path.ismount(target):
@@ -559,15 +460,6 @@ def make_directory(server_dir: pathlib.Path, relative: str) -> dict:
 
 
 def member_target(destination: pathlib.Path, name: str) -> pathlib.Path:
-    """Where one archive member is allowed to land.
-
-    Member names come from whoever built the zip, not from the dashboard, so
-    they are the one path in this file that no amount of checking upstream can
-    vouch for. `../../server.properties` and `/etc/cron.d/x` are both legal
-    strings in the format, and both are refused here rather than normalised:
-    silently rewriting an escape to something harmless would extract an archive
-    that is lying about its contents and report success.
-    """
     cleaned = name.replace("\\", "/")
     if cleaned.startswith("/"):
         raise PermissionError(f"archive member has an absolute path: {name}")
@@ -584,12 +476,6 @@ def member_target(destination: pathlib.Path, name: str) -> pathlib.Path:
 
 
 def extract_mkdir(destination: pathlib.Path, target: pathlib.Path) -> None:
-    """Create the levels of `target` under `destination`, following no symlink.
-
-    Checked one level at a time rather than with parents=True, because a symlink
-    already sitting inside the destination would otherwise be followed out of
-    the tree by the mkdir itself.
-    """
     walked = destination
     for part in target.relative_to(destination).parts:
         walked = walked / part
@@ -601,15 +487,6 @@ def extract_mkdir(destination: pathlib.Path, target: pathlib.Path) -> None:
 def extract_archive(
     server_dir: pathlib.Path, relative: str, destination_relative: str, limit_bytes: int
 ) -> dict:
-    """Unpack a .zip into a directory inside the tree.
-
-    Three things an archive can do that a plain upload cannot, all refused:
-    point a member outside the destination (see member_target), carry a symlink
-    that would later be written through, and declare a modest compressed size
-    that expands to fill the disk. The last is why the running total is checked
-    against the budget as bytes are copied rather than trusting the sizes in the
-    central directory, which the archive itself supplies.
-    """
     archive = safe_path(server_dir, relative)
     if not archive.is_file():
         raise FileNotFoundError(relative)
@@ -669,12 +546,6 @@ def extract_archive(
 
 
 def move_path(server_dir: pathlib.Path, relative: str, destination: str) -> dict:
-    """Rename or move one entry, both ends confined to the tree.
-
-    Refuses an existing destination outright. shutil.move() would otherwise
-    treat a directory destination as "move inside it", which turns a mistyped
-    rename into a silent reorganisation.
-    """
     source = safe_leaf(server_dir, relative)
     if not source.exists() and not source.is_symlink():
         raise FileNotFoundError(relative)
@@ -688,13 +559,6 @@ def move_path(server_dir: pathlib.Path, relative: str, destination: str) -> dict
 
 
 def delete_paths(server_dir: pathlib.Path, relatives: Any) -> dict:
-    """Remove each path, reporting per-entry outcomes rather than stopping.
-
-    A multi-select delete where the third of five fails should still tell the
-    operator which four went, so each entry is caught on its own. safe_leaf()
-    rejects an empty path, which is what keeps server_dir itself from being the
-    thing that gets removed.
-    """
     removed: list[str] = []
     failed: list[dict] = []
     for relative in relatives if isinstance(relatives, (list, tuple)) else []:
@@ -713,17 +577,6 @@ def delete_paths(server_dir: pathlib.Path, relatives: Any) -> dict:
 
 
 class UploadStore:
-    """Uploads in flight, each streaming into a temp file beside its target.
-
-    The bytes land next to the final path rather than in /tmp for two reasons:
-    the commit is then a rename on the same filesystem, so it is atomic and
-    cheap even for a 500 MB archive, and a partial upload never appears under
-    the real name where the server might try to load it.
-
-    An upload the dashboard never finishes — browser closed, tunnel dropped —
-    would otherwise leave its temp file and an open handle behind forever, so
-    anything idle past UPLOAD_IDLE_SECONDS is swept when the next one starts.
-    """
 
     def __init__(self, limit_bytes: int) -> None:
         self.limit = limit_bytes
