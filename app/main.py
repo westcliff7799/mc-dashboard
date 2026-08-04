@@ -43,6 +43,8 @@ _last_target: tuple[str, int, str] | None = None
 RCON_PROBE_TIMEOUT = 5.0
 RCON_PROBE_SECONDS = 30.0
 
+EXPECTED_AGENT_VERSION = "1.0.0"
+
 _rcon_last: dict[str, Any] = {}
 _rcon_probed_at = 0.0
 
@@ -442,6 +444,7 @@ async def api_capabilities(request: Request):
         "rcon": settings.rcon_enabled,
         "agent": hub.connected,
         "agent_configured": settings.agent_enabled,
+        "agent_expected_version": EXPECTED_AGENT_VERSION,
         "host": f"{settings.mc_host}:{settings.mc_port}",
         "role": role,
         "permissions": sorted(auth.permissions_for(user, role)),

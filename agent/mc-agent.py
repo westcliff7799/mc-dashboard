@@ -1,5 +1,13 @@
 """Minecraft dashboard agent — runs on the machine hosting the server.
 
+AGENT_VERSION below travels up in every state push and the dashboard shows it
+beside the process tile, warning when it does not match the version the
+dashboard shipped with. This machine and the dashboard are updated by different
+people at different times, so "is the agent even the build I think it is?" is
+otherwise a question nobody can answer from either end. Bump it in the same
+commit as any change to the message protocol or the action list, and bump
+EXPECTED_AGENT_VERSION in app/main.py to match.
+
 Connects OUTBOUND to the dashboard over wss:// and holds the socket open, so
 this machine needs no port forwarding, no static IP, and no inbound firewall
 rule. Everything it can do is bounded by SERVER_DIR and the four power actions;
@@ -52,6 +60,7 @@ try:
 except ImportError:
     raise SystemExit("Missing dependency. Run:  pip install websockets")
 
+AGENT_VERSION = "1.0.0"
 LOG_POLL_SECONDS = 0.5
 STATE_PUSH_SECONDS = 10
 MAX_READ_BYTES = 256 * 1024
@@ -246,6 +255,7 @@ class Controller:
             "running": running,
             "server_dir": str(self.server_dir),
             "writable": writes_allowed(self.config),
+            "version": AGENT_VERSION,
         }
         if endpoints := self.endpoints.current():
             info["endpoints"] = endpoints
@@ -977,7 +987,10 @@ async def main() -> None:
 
     controller = Controller(config)
     uploads = UploadStore(upload_limit(config))
-    print(f"[agent] server_dir={controller.server_dir} mode={controller.mode}", flush=True)
+    print(
+        f"[agent] v{AGENT_VERSION} server_dir={controller.server_dir} mode={controller.mode}",
+        flush=True,
+    )
     print(
         "[agent] files: read/write, uploads up to "
         f"{uploads.limit // (1024 * 1024)} MB"

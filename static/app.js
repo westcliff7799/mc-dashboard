@@ -9,6 +9,7 @@ let currentDir = '';
 let currentEntries = [];
 let openFilePath = null;
 let agentWritable = null;
+let lastAgentState = null;
 const selection = new Set();
 
 function toast(message, bad = false) {
@@ -127,7 +128,34 @@ function renderStatus(status) {
   if (status.agent_state) renderAgentState(status.agent_state);
 }
 
+function renderAgentVersion(state) {
+  const notice = $('agent-version-notice');
+  const expected = capabilities.agent_expected_version;
+  if (!capabilities.agent || !expected) {
+    notice.hidden = true;
+    return;
+  }
+  const running = state && state.version;
+  if (!running) {
+    $('agent-version-text').innerHTML = '<strong>Agent version unknown.</strong> '
+      + `This agent predates version reporting; the dashboard expects ${expected}. `
+      + 'Update mc-agent.py on the server machine.';
+    notice.hidden = false;
+    return;
+  }
+  if (running !== expected) {
+    $('agent-version-text').innerHTML = `<strong>Agent is v${running}, `
+      + `dashboard expects v${expected}.</strong> `
+      + 'Copy the current mc-agent.py to the server machine and restart it.';
+    notice.hidden = false;
+    return;
+  }
+  notice.hidden = true;
+}
+
 function renderAgentState(state) {
+  lastAgentState = state;
+  renderAgentVersion(state);
   if (!state || !Object.keys(state).length) {
     agentWritable = null;
     $('t-process').textContent = '—';
@@ -142,6 +170,7 @@ function renderAgentState(state) {
   $('t-process').textContent = state.running ? 'Running' : 'Stopped';
   const bits = [];
   if (state.mode) bits.push(state.mode);
+  if (state.version) bits.push(`agent v${state.version}`);
   if (state.cpu) bits.push(`cpu ${state.cpu}`);
   if (state.memory) bits.push(state.memory);
   if (state.pid && state.pid !== '0') bits.push(`pid ${state.pid}`);
@@ -161,6 +190,7 @@ function setTabVisible(name, visible) {
 
 function applyCapabilities() {
   const agent = capabilities.agent;
+  renderAgentVersion(lastAgentState);
 
   const seesConsole = can('console.view') || can('console.command');
   const seesFiles = can('files.browse') || can('files.read') || can('files.write')
