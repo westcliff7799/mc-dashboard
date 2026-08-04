@@ -686,6 +686,45 @@ function pickedItems(list) {
   return found;
 }
 
+const queue = { running: false, paused: false, stopped: false, request: null, wake: null };
+
+function renderQueueControls() {
+  $('btn-upload-pause').textContent = queue.paused ? 'Resume' : 'Pause';
+  $('btn-upload-pause').disabled = queue.stopped;
+  $('btn-upload-stop').disabled = queue.stopped;
+}
+
+function pauseUploads() {
+  if (!queue.running || queue.stopped) return;
+  queue.paused = !queue.paused;
+  if (!queue.paused && queue.wake) {
+    const wake = queue.wake;
+    queue.wake = null;
+    wake();
+  }
+  renderQueueControls();
+}
+
+function stopUploads() {
+  if (!queue.running || queue.stopped) return;
+  queue.stopped = true;
+  queue.paused = false;
+  if (queue.request) queue.request.abort();
+  if (queue.wake) {
+    const wake = queue.wake;
+    queue.wake = null;
+    wake();
+  }
+  renderQueueControls();
+}
+
+async function waitWhilePaused(remaining) {
+  while (queue.paused && !queue.stopped) {
+    $('upload-name').textContent = `Paused — ${remaining} left`;
+    await new Promise((resolve) => { queue.wake = resolve; });
+  }
+}
+
 function uploadOne(item, overwrite) {
   return new Promise((resolve, reject) => {
     const label = joinPath(item.dir, item.file.name);
@@ -695,6 +734,7 @@ function uploadOne(item, overwrite) {
     form.append('upload', item.file, item.file.name);
 
     const request = new XMLHttpRequest();
+    queue.request = request;
     request.open('POST', '/api/files/upload');
     request.upload.addEventListener('progress', (event) => {
       if (event.lengthComputable) $('upload-bar').value = (event.loaded / event.total) * 100;
@@ -709,7 +749,7 @@ function uploadOne(item, overwrite) {
     request.addEventListener('error', () => reject(new Error(`${label}: the upload failed`)));
     request.addEventListener('abort', () => reject(new Error(`${label}: upload cancelled`)));
     request.send(form);
-  });
+  }).finally(() => { queue.request = null; });
 }
 
 async function uploadAll(found) {
@@ -720,6 +760,7 @@ async function uploadAll(found) {
 
   const blocker = writeBlocker();
   if (blocker) { toast(blocker, true); return; }
+  if (queue.running) { toast('An upload is already running.', true); return; }
 
   const here = new Set(currentEntries.map((entry) => entry.name));
   const top = (item) => (item.dir || item.file.name).split('/')[0];
@@ -731,27 +772,50 @@ async function uploadAll(found) {
   }
   const replacing = new Set(clashes);
 
+  queue.running = true;
+  queue.paused = false;
+  queue.stopped = false;
+  queue.request = null;
+  queue.wake = null;
+  renderQueueControls();
+
+  let done = 0;
   $('upload-row').hidden = false;
   try {
     for (const folder of [...folders].sort()) {
+      if (queue.stopped) break;
+      await waitWhilePaused(`${folders.size} folders`);
+      if (queue.stopped) break;
       $('upload-name').textContent = folder;
       $('upload-bar').value = 0;
       await post('/api/files/folders', { path: joinPath(currentDir, folder) });
     }
     for (const [index, item] of items.entries()) {
+      if (queue.stopped) break;
+      await waitWhilePaused(`${items.length - index} of ${items.length}`);
+      if (queue.stopped) break;
+
       const label = joinPath(item.dir, item.file.name);
       $('upload-name').textContent = items.length > 1
         ? `${label} — ${index + 1} of ${items.length}`
         : label;
       $('upload-bar').value = 0;
       await uploadOne(item, replacing.has(top(item)));
+      done += 1;
     }
-    if (items.length === 1) toast(`Uploaded ${joinPath(items[0].dir, items[0].file.name)}`);
+
+    if (queue.stopped) toast(`Stopped — ${done} of ${items.length} files uploaded`);
+    else if (items.length === 1) toast(`Uploaded ${joinPath(items[0].dir, items[0].file.name)}`);
     else if (items.length) toast(`Uploaded ${items.length} files`);
     else toast(`Created ${[...folders].sort()[0]}`);
   } catch (error) {
-    toast(error.message, true);
+    if (queue.stopped) toast(`Stopped — ${done} of ${items.length} files uploaded`);
+    else toast(error.message, true);
   } finally {
+    queue.running = false;
+    queue.paused = false;
+    queue.request = null;
+    queue.wake = null;
     $('upload-row').hidden = true;
     $('file-input').value = '';
     $('folder-input').value = '';
@@ -768,6 +832,8 @@ $('btn-file-folder').addEventListener('click', newFolder);
 $('btn-file-new').addEventListener('click', newFile);
 $('btn-file-rename').addEventListener('click', renameSelected);
 $('btn-file-delete').addEventListener('click', deleteSelected);
+$('btn-upload-pause').addEventListener('click', pauseUploads);
+$('btn-upload-stop').addEventListener('click', stopUploads);
 $('btn-file-unzip').addEventListener('click', unzipSelected);
 $('btn-file-download').addEventListener('click', downloadSelected);
 $('btn-editor-close').addEventListener('click', closeEditor);

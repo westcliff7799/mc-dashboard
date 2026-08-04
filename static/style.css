@@ -276,6 +276,7 @@ button.action.primary { background: var(--accent); border-color: var(--accent); 
   color: var(--text-secondary);
 }
 .upload .upload-name { font-family: var(--mono); overflow-wrap: anywhere; }
+.upload .action { flex: none; padding: 4px 10px; font-size: 12px; }
 .upload progress {
   flex: 1;
   min-width: 120px;
