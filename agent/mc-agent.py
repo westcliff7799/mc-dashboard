@@ -1,13 +1,5 @@
 """Minecraft dashboard agent — runs on the machine hosting the server.
 
-AGENT_VERSION below travels up in every state push and the dashboard shows it
-beside the process tile, warning when it does not match the version the
-dashboard shipped with. This machine and the dashboard are updated by different
-people at different times, so "is the agent even the build I think it is?" is
-otherwise a question nobody can answer from either end. Bump it in the same
-commit as any change to the message protocol or the action list, and bump
-EXPECTED_AGENT_VERSION in app/main.py to match.
-
 Connects OUTBOUND to the dashboard over wss:// and holds the socket open, so
 this machine needs no port forwarding, no static IP, and no inbound firewall
 rule. Everything it can do is bounded by SERVER_DIR and the four power actions;
@@ -60,7 +52,7 @@ try:
 except ImportError:
     raise SystemExit("Missing dependency. Run:  pip install websockets")
 
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.1.0"
 LOG_POLL_SECONDS = 0.5
 STATE_PUSH_SECONDS = 10
 MAX_READ_BYTES = 256 * 1024
@@ -248,6 +240,15 @@ class Controller:
             return self.screen in out
         return self.managed is not None and self.managed.poll() is None
 
+    def tree_evidence(self) -> dict:
+        evidence: dict = {"has_properties": (self.server_dir / "server.properties").is_file()}
+        log = self.server_dir / "logs" / "latest.log"
+        try:
+            evidence["log_age"] = max(time.time() - log.stat().st_mtime, 0.0)
+        except OSError:
+            evidence["log_age"] = None
+        return evidence
+
     def state(self) -> dict:
         running = self.is_running()
         info: dict = {
@@ -259,6 +260,7 @@ class Controller:
         }
         if endpoints := self.endpoints.current():
             info["endpoints"] = endpoints
+        info.update(self.tree_evidence())
         with contextlib.suppress(OSError):
             usage = shutil.disk_usage(self.server_dir)
             info["disk_free"], info["disk_total"] = usage.free, usage.total
@@ -515,6 +517,14 @@ def replace_atomically(target: pathlib.Path, temporary: pathlib.Path) -> None:
     """
     if target.exists():
         shutil.copymode(target, temporary)
+    if target.is_file() and os.path.ismount(target):
+        blob = temporary.read_bytes()
+        with target.open("wb") as handle:
+            handle.write(blob)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.unlink(missing_ok=True)
+        return
     os.replace(temporary, target)
 
 

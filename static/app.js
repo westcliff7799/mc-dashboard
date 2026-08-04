@@ -153,9 +153,45 @@ function renderAgentVersion(state) {
   notice.hidden = true;
 }
 
+const STALE_LOG_SECONDS = 600;
+
+function treeComplaint(state) {
+  if (!state || !state.running || !state.server_dir) return null;
+  if (state.has_properties === undefined) return null;
+  const dir = state.server_dir;
+  if (state.has_properties === false) {
+    return `<strong>${dir} has no server.properties.</strong> The server is running, `
+      + 'but this is not its directory — uploads and edits here will never reach it. '
+      + 'Check <code>server_dir</code> in agent.conf against the volume the server actually reads.';
+  }
+  if (state.log_age === null || state.log_age === undefined) {
+    return `<strong>No logs/latest.log under ${dir}.</strong> The server is running and `
+      + 'should be writing one, so this is probably not the directory it uses. '
+      + 'Check <code>server_dir</code> in agent.conf.';
+  }
+  if (state.log_age > STALE_LOG_SECONDS) {
+    return `<strong>logs/latest.log under ${dir} is ${duration(Math.round(state.log_age))} old</strong> `
+      + 'while the server is running. Either the server is idle, or this is not the '
+      + 'directory it writes to — in which case edits here never reach it.';
+  }
+  return null;
+}
+
+function renderTreeNotice(state) {
+  const notice = $('agent-tree-notice');
+  const complaint = capabilities.agent ? treeComplaint(state) : null;
+  if (!complaint) {
+    notice.hidden = true;
+    return;
+  }
+  $('agent-tree-text').innerHTML = complaint;
+  notice.hidden = false;
+}
+
 function renderAgentState(state) {
   lastAgentState = state;
   renderAgentVersion(state);
+  renderTreeNotice(state);
   if (!state || !Object.keys(state).length) {
     agentWritable = null;
     $('t-process').textContent = '—';
@@ -191,6 +227,7 @@ function setTabVisible(name, visible) {
 function applyCapabilities() {
   const agent = capabilities.agent;
   renderAgentVersion(lastAgentState);
+  renderTreeNotice(lastAgentState);
 
   const seesConsole = can('console.view') || can('console.command');
   const seesFiles = can('files.browse') || can('files.read') || can('files.write')
@@ -516,6 +553,17 @@ function closeEditor() {
   $('editor-text').value = '';
 }
 
+const SERVER_OWNED_FILES = [
+  'server.properties', 'ops.json', 'whitelist.json',
+  'banned-players.json', 'banned-ips.json', 'usercache.json',
+];
+
+function serverRewritesOnStop(path) {
+  const running = lastAgentState && lastAgentState.running;
+  const name = String(path || '').split('/').pop();
+  return Boolean(running) && SERVER_OWNED_FILES.includes(name);
+}
+
 async function openFile(path) {
   try {
     const data = await api(`/api/files/read?path=${encodeURIComponent(path)}`);
@@ -524,7 +572,12 @@ async function openFile(path) {
     text.value = data.content;
     text.readOnly = !mayWriteFiles();
     $('editor-path').textContent = openFilePath;
-    $('editor-note').textContent = text.readOnly ? 'read-only' : bytes(data.size);
+    const rewritten = serverRewritesOnStop(openFilePath);
+    $('editor-note').textContent = text.readOnly
+      ? 'read-only'
+      : rewritten
+        ? `${bytes(data.size)} — stop the server before editing this`
+        : bytes(data.size);
     $('btn-editor-save').hidden = text.readOnly;
     $('editor').hidden = false;
     $('editor').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -535,6 +588,11 @@ async function openFile(path) {
 
 async function saveFile() {
   if (!openFilePath) return;
+  if (serverRewritesOnStop(openFilePath) && !confirm(
+    `The server is running and rewrites ${openFilePath.split('/').pop()} from memory when it `
+    + 'stops, which will discard this edit. Stop the server first, then edit, then start it.\n\n'
+    + 'Save anyway?'
+  )) return;
   const button = $('btn-editor-save');
   button.disabled = true;
   try {

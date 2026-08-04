@@ -43,7 +43,7 @@ _last_target: tuple[str, int, str] | None = None
 RCON_PROBE_TIMEOUT = 5.0
 RCON_PROBE_SECONDS = 30.0
 
-EXPECTED_AGENT_VERSION = "1.0.0"
+EXPECTED_AGENT_VERSION = "1.1.0"
 
 _rcon_last: dict[str, Any] = {}
 _rcon_probed_at = 0.0
@@ -104,18 +104,6 @@ def derive_state(online: bool) -> str:
 
 
 async def probe_rcon() -> dict[str, Any]:
-    """Ask RCON for the player list, on its own slower clock than the ping.
-
-    Minecraft logs a thread start and a shutdown for every RCON connection, and
-    app/rcon.py opens one per command by design, so probing on every poll writes
-    six start/stop pairs a minute into the server console forever. A player
-    count does not need ten-second freshness. The ping still runs each tick, so
-    online/offline is as responsive as it was.
-
-    The caller holds the returned dict between probes rather than recomputing
-    it, which is also what keeps the RCON tier from dropping out on the ticks
-    that do not probe.
-    """
     rcon_host, rcon_port, _ = resolve_target("rcon")
     try:
         output = await rcon.execute(

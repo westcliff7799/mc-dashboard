@@ -36,14 +36,7 @@ async def _read_packet(reader: asyncio.StreamReader) -> tuple[int, int, str]:
 
 
 async def execute(host: str, port: int, password: str, command: str, timeout: float = 8.0) -> str:
-    """Authenticate, run one command, return its output.
-
-    The timeout covers the wait for `_lock` as well as the exchange itself.
-    Taking the lock first and timing only the exchange would bound the wrong
-    half: the status poller probes on every tick, so an operator's command
-    arriving behind a probe that is itself timing out against a dead tunnel
-    would queue for as long as that took, with nothing capping it.
-    """
+    """Authenticate, run one command, return its output."""
     if not password:
         raise RconError("RCON is not configured")
 
